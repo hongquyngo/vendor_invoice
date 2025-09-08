@@ -55,4 +55,3 @@ sentry-sdk  # Error tracking
 boto3
 botocore
 Pillow
-pywin32
