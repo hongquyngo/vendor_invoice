@@ -14,7 +14,8 @@ from utils.invoice_data import (
     validate_invoice_selection,
     create_purchase_invoice,
     generate_invoice_number,  # Use the NEW function
-    get_payment_terms
+    get_payment_terms,
+    calculate_days_from_term_name
 )
 from utils.invoice_service import InvoiceService
 
@@ -45,6 +46,8 @@ if 'current_page' not in st.session_state:
     st.session_state.current_page = 1
 if 'items_per_page' not in st.session_state:
     st.session_state.items_per_page = 50  # Default items per page
+if 'is_advance_payment' not in st.session_state:
+    st.session_state.is_advance_payment = False
 
 def main():
     st.title("📝 Create Purchase Invoice")
@@ -367,7 +370,7 @@ def show_an_selection():
         col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 1])
         
         with col1:
-            if st.button("⏮️ First", disabled=st.session_state.current_page == 1, use_container_width=True):
+            if st.button("⮜ First", disabled=st.session_state.current_page == 1, use_container_width=True):
                 st.session_state.current_page = 1
                 st.session_state.select_all = False
                 st.rerun()
@@ -388,7 +391,7 @@ def show_an_selection():
                 st.rerun()
         
         with col5:
-            if st.button("Last ⏭️", disabled=st.session_state.current_page == total_pages, use_container_width=True):
+            if st.button("Last ⮞", disabled=st.session_state.current_page == total_pages, use_container_width=True):
                 st.session_state.current_page = total_pages
                 st.session_state.select_all = False
                 st.rerun()
@@ -462,41 +465,59 @@ def show_invoice_preview():
     # Store details for next step
     st.session_state.details_df = details_df
     
-    # Invoice header form
+    # Invoice header section
     st.markdown("### 📄 Invoice Information")
     
+    # Advance Payment checkbox - OUTSIDE THE FORM for immediate refresh
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Store current state
+        current_advance_state = st.session_state.is_advance_payment
+        
+        # Checkbox outside form
+        advance_payment = st.checkbox(
+            "Advance Payment Invoice",
+            value=st.session_state.is_advance_payment,
+            key="advance_payment_toggle",
+            help="Check this for advance payment invoices (PI). This will change the invoice number suffix."
+        )
+        
+        # Check if state changed and trigger refresh
+        if advance_payment != current_advance_state:
+            st.session_state.is_advance_payment = advance_payment
+            st.rerun()
+    
+    # Generate invoice number based on current advance payment state
+    vendor_code = selected_df['vendor_code'].iloc[0]
+    vendor_id = details_df['vendor_id'].iloc[0] if not details_df.empty else None
+    buyer_id = details_df['entity_id'].iloc[0] if not details_df.empty else None
+    
+    # Debug output
+    print("\n" + "🔴"*40)
+    print("🔴 INVOICE PREVIEW - GENERATING INVOICE NUMBER 🔴")
+    print("🔴"*40)
+    print(f"📌 vendor_code: {vendor_code}")
+    print(f"📌 vendor_id: {vendor_id} (type: {type(vendor_id)})")
+    print(f"📌 buyer_id: {buyer_id} (type: {type(buyer_id)})")
+    print(f"📌 is_advance_payment: {st.session_state.is_advance_payment}")
+    
+    invoice_number = generate_invoice_number(vendor_id, buyer_id, st.session_state.is_advance_payment)
+    print(f"🔴 RESULT: {invoice_number}")
+    print("🔴"*40 + "\n")
+    
+    # Show invoice type indicator
+    with col2:
+        if st.session_state.is_advance_payment:
+            st.info("🔵 **Invoice Type: Advance Payment (PI)**")
+        else:
+            st.success("🟢 **Invoice Type: Commercial Invoice (CI)**")
+    
+    # Invoice form
     with st.form("invoice_form"):
         col1, col2 = st.columns(2)
         
         with col1:
-            # Debug output with clear markers
-            print("\n" + "🔴"*40)
-            print("🔴 INVOICE PREVIEW - GENERATING INVOICE NUMBER 🔴")
-            print("🔴"*40)
-            
-            # Auto-generate invoice number
-            vendor_code = selected_df['vendor_code'].iloc[0]
-            vendor_id = details_df['vendor_id'].iloc[0] if not details_df.empty else None
-            buyer_id = details_df['entity_id'].iloc[0] if not details_df.empty else None
-            is_advance_payment = st.session_state.get('advance_payment_checkbox', False)
-            
-            # Debug logging
-            print(f"📌 vendor_code: {vendor_code}")
-            print(f"📌 vendor_id: {vendor_id} (type: {type(vendor_id)})")
-            print(f"📌 buyer_id: {buyer_id} (type: {type(buyer_id)})")
-            print(f"📌 is_advance_payment: {is_advance_payment}")
-            print(f"📌 details_df.shape: {details_df.shape}")
-            print(f"📌 details_df.columns: {list(details_df.columns)}")
-            
-            if not details_df.empty:
-                print("\n📌 First row of details_df:")
-                print(details_df.iloc[0].to_dict())
-            
-            print("\n🔴 CALLING generate_invoice_number NOW...")
-            invoice_number = generate_invoice_number(vendor_id, buyer_id, is_advance_payment)
-            print(f"🔴 RESULT: {invoice_number}")
-            print("🔴"*40 + "\n")
-            
             st.text_input("Invoice Number", value=invoice_number, disabled=True, key="invoice_number")
             
             invoice_date = st.date_input(
@@ -505,51 +526,95 @@ def show_invoice_preview():
                 key="invoice_date"
             )
             
-            # Payment terms
-            payment_terms_df = get_payment_terms()
-            payment_term_id, payment_term_name, payment_days = service.determine_payment_term(selected_df, details_df)
+            # =================== PAYMENT TERMS FILTERED BY SELECTED ANs ===================
+            # Extract payment terms ONLY from selected ANs
+            unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
             
-            term_options = {
-                row['name']: {
-                    'id': row['id'],
-                    'days': row['days'],
-                    'description': row.get('description', '')
+            # Debug print
+            print(f"\n🔵 Payment terms from selected ANs: {unique_payment_terms_from_selected}")
+            
+            # Build payment term options ONLY from selected ANs
+            term_options = {}
+            default_term_name = None
+            
+            if unique_payment_terms_from_selected:
+                # Get all payment terms data for reference
+                all_payment_terms_df = get_payment_terms()
+                
+                # Get the most common payment term from selected ANs
+                most_common_term = selected_df['payment_term'].mode()
+                if not most_common_term.empty:
+                    default_term_name = most_common_term.iloc[0]
+                
+                # Build options from selected AN payment terms
+                for term_name in unique_payment_terms_from_selected:
+                    # Look up in database
+                    db_match = all_payment_terms_df[all_payment_terms_df['name'] == term_name]
+                    
+                    if not db_match.empty:
+                        row = db_match.iloc[0]
+                        term_options[term_name] = {
+                            'id': int(row['id']),
+                            'days': int(row['days']),
+                            'description': row.get('description', '')
+                        }
+                    else:
+                        # Not in database - calculate days and use a default ID
+                        days = calculate_days_from_term_name(term_name)
+                        # Try to find ID from details_df if available
+                        term_id = 1  # Default
+                        if not details_df.empty and 'payment_term_id' in details_df.columns:
+                            # Find matching row in details
+                            detail_match = details_df[details_df.get('payment_term_name', '') == term_name]
+                            if not detail_match.empty:
+                                term_id = int(detail_match.iloc[0]['payment_term_id'])
+                        
+                        term_options[term_name] = {
+                            'id': term_id,
+                            'days': days,
+                            'description': f'{term_name} ({days} days)'
+                        }
+            else:
+                # No payment terms found - use a default
+                st.warning("⚠️ No payment terms found in selected ANs. Using default.")
+                term_options = {
+                    'Net 30': {'id': 1, 'days': 30, 'description': 'Payment due in 30 days'}
                 }
-                for _, row in payment_terms_df.iterrows()
-            }
+                default_term_name = 'Net 30'
             
+            # Get list of term names for dropdown
             term_names = list(term_options.keys())
+            
+            # Set default index
             default_index = 0
-            if payment_term_name in term_names:
-                default_index = term_names.index(payment_term_name)
+            if default_term_name and default_term_name in term_names:
+                default_index = term_names.index(default_term_name)
             
             selected_term = st.selectbox(
                 "Payment Terms",
                 options=term_names,
                 index=default_index,
                 key="payment_terms",
-                help="Payment term from Purchase Order"
+                help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)"
             )
             
             if term_options[selected_term].get('description'):
                 st.caption(term_options[selected_term]['description'])
+            # =================== END PAYMENT TERMS SECTION ===================
         
         with col2:
-            # Advance Payment checkbox
-            advance_payment = st.checkbox(
-                "Advance Payment",
-                value=False,
-                key="advance_payment_checkbox",
-                help="Check this for advance payment invoices (PI)"
-            )
-            
             # Commercial Invoice input - disabled if advance payment
             commercial_inv = st.text_input(
                 "Commercial Invoice No.",
                 key="commercial_invoice_no",
-                disabled=advance_payment,
-                placeholder="Required for Commercial Invoices" if not advance_payment else "Not required for Advance Payment"
+                disabled=st.session_state.is_advance_payment,
+                placeholder="Required for Commercial Invoices" if not st.session_state.is_advance_payment else "Not required for Advance Payment"
             )
+            
+            if st.session_state.is_advance_payment:
+                st.caption("💡 Commercial invoice number not required for advance payments")
+            else:
+                st.caption("⚠️ Required field for commercial invoices")
             
             # Calculate due date
             term_days = term_options[selected_term]['days']
@@ -564,7 +629,7 @@ def show_invoice_preview():
             
             email_accountant = st.checkbox(
                 "Email to Accountant",
-                value=True,
+                value=False,
                 key="email_to_accountant"
             )
         
@@ -606,14 +671,14 @@ def show_invoice_preview():
     
     if proceed_btn:
         # Validate Commercial Invoice number if not advance payment
-        if not st.session_state.get('advance_payment_checkbox', False) and not st.session_state.commercial_invoice_no:
+        if not st.session_state.is_advance_payment and not st.session_state.commercial_invoice_no:
             st.error("❌ Commercial Invoice Number is required for Commercial Invoices")
             return
         
         # Prepare invoice data
         st.session_state.invoice_data = {
             'invoice_number': invoice_number,
-            'commercial_invoice_no': st.session_state.commercial_invoice_no if not st.session_state.get('advance_payment_checkbox', False) else '',
+            'commercial_invoice_no': st.session_state.commercial_invoice_no if not st.session_state.is_advance_payment else '',
             'invoiced_date': st.session_state.invoice_date,
             'due_date': st.session_state.due_date,
             'total_invoiced_amount': totals['total_value'],
@@ -624,7 +689,7 @@ def show_invoice_preview():
             'payment_term_id': term_options[st.session_state.payment_terms]['id'],
             'email_to_accountant': 1 if st.session_state.email_to_accountant else 0,
             'created_by': st.session_state.username,
-            'invoice_type': 'ADVANCE_PAYMENT_INVOICE' if st.session_state.get('advance_payment_checkbox', False) else 'COMMERCIAL_INVOICE'
+            'invoice_type': 'ADVANCE_PAYMENT_INVOICE' if st.session_state.is_advance_payment else 'COMMERCIAL_INVOICE'
         }
         st.session_state.wizard_step = 'confirm'
         st.rerun()
@@ -744,6 +809,7 @@ def show_invoice_confirm():
                                 st.session_state.details_df = None
                                 st.session_state.selected_df = None
                                 st.session_state.current_page = 1  # Reset to first page
+                                st.session_state.is_advance_payment = False  # Reset advance payment state
                                 st.rerun()
                         
                         with col2:
