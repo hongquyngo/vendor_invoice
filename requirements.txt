@@ -28,7 +28,7 @@ streamlit-authenticator # Optional, or build custom
 # Caching & Performance
 cachetools
 streamlit-aggrid # Advanced tables
-redis==5.0.1  # Optional for external caching
+redis # Optional for external caching
 
 # Export & Reporting
 reportlab # PDF generation
