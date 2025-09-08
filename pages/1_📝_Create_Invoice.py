@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime, date
 import time
 
-# Import utils - IMPORTANT: Import the NEW module
+# Import utils
 from utils.auth import AuthManager
 from utils.invoice_data import (
     get_uninvoiced_ans, 
@@ -13,11 +13,17 @@ from utils.invoice_data import (
     get_invoice_details,
     validate_invoice_selection,
     create_purchase_invoice,
-    generate_invoice_number,  # Use the NEW function
+    generate_invoice_number,
     get_payment_terms,
     calculate_days_from_term_name
 )
 from utils.invoice_service import InvoiceService
+from utils.currency_utils import (
+    get_available_currencies,
+    calculate_exchange_rates,
+    format_exchange_rate,
+    get_invoice_amounts_in_currency
+)
 
 # Page config
 st.set_page_config(
@@ -370,7 +376,7 @@ def show_an_selection():
         col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 1])
         
         with col1:
-            if st.button("⮜ First", disabled=st.session_state.current_page == 1, use_container_width=True):
+            if st.button("⏮ First", disabled=st.session_state.current_page == 1, use_container_width=True):
                 st.session_state.current_page = 1
                 st.session_state.select_all = False
                 st.rerun()
@@ -391,7 +397,7 @@ def show_an_selection():
                 st.rerun()
         
         with col5:
-            if st.button("Last ⮞", disabled=st.session_state.current_page == total_pages, use_container_width=True):
+            if st.button("Last ⏭", disabled=st.session_state.current_page == total_pages, use_container_width=True):
                 st.session_state.current_page = total_pages
                 st.session_state.select_all = False
                 st.rerun()
@@ -465,6 +471,10 @@ def show_invoice_preview():
     # Store details for next step
     st.session_state.details_df = details_df
     
+    # Get PO currency info
+    po_currency_id = details_df['po_currency_id'].iloc[0] if not details_df.empty else 1
+    po_currency_code = details_df['po_currency_code'].iloc[0] if not details_df.empty else 'USD'
+    
     # Invoice header section
     st.markdown("### 📄 Invoice Information")
     
@@ -493,18 +503,7 @@ def show_invoice_preview():
     vendor_id = details_df['vendor_id'].iloc[0] if not details_df.empty else None
     buyer_id = details_df['entity_id'].iloc[0] if not details_df.empty else None
     
-    # Debug output
-    print("\n" + "🔴"*40)
-    print("🔴 INVOICE PREVIEW - GENERATING INVOICE NUMBER 🔴")
-    print("🔴"*40)
-    print(f"📌 vendor_code: {vendor_code}")
-    print(f"📌 vendor_id: {vendor_id} (type: {type(vendor_id)})")
-    print(f"📌 buyer_id: {buyer_id} (type: {type(buyer_id)})")
-    print(f"📌 is_advance_payment: {st.session_state.is_advance_payment}")
-    
     invoice_number = generate_invoice_number(vendor_id, buyer_id, st.session_state.is_advance_payment)
-    print(f"🔴 RESULT: {invoice_number}")
-    print("🔴"*40 + "\n")
     
     # Show invoice type indicator
     with col2:
@@ -512,6 +511,60 @@ def show_invoice_preview():
             st.info("🔵 **Invoice Type: Advance Payment (PI)**")
         else:
             st.success("🟢 **Invoice Type: Commercial Invoice (CI)**")
+    
+    # Currency selection section
+    st.markdown("### 💱 Currency Selection")
+    
+    # Get available currencies
+    currencies_df = get_available_currencies()
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.info(f"**PO Currency:** {po_currency_code}")
+    
+    with col2:
+        # Currency selection dropdown
+        currency_options = currencies_df['code'].tolist()
+        currency_display = [f"{row['code']} - {row['name']}" for _, row in currencies_df.iterrows()]
+        
+        # Default to PO currency if available, otherwise USD
+        default_index = 0
+        if po_currency_code in currency_options:
+            default_index = currency_options.index(po_currency_code)
+        elif 'USD' in currency_options:
+            default_index = currency_options.index('USD')
+        
+        selected_currency_display = st.selectbox(
+            "Invoice Currency",
+            options=currency_display,
+            index=default_index,
+            key="invoice_currency_select",
+            help="Select the currency for this invoice"
+        )
+        
+        # Extract currency code
+        invoice_currency_code = selected_currency_display.split(' - ')[0]
+        invoice_currency_id = currencies_df[currencies_df['code'] == invoice_currency_code]['id'].iloc[0]
+    
+    with col3:
+        # Calculate and display exchange rates
+        if po_currency_code != invoice_currency_code:
+            with st.spinner("Fetching exchange rates..."):
+                rates = calculate_exchange_rates(po_currency_code, invoice_currency_code)
+            
+            st.markdown("**Exchange Rates:**")
+            st.text(f"1 {po_currency_code} = {format_exchange_rate(rates['po_to_invoice_rate'])} {invoice_currency_code}")
+            if invoice_currency_code != 'USD':
+                st.text(f"1 USD = {format_exchange_rate(rates['usd_exchange_rate'])} {invoice_currency_code}")
+        else:
+            rates = {'po_to_invoice_rate': 1.0, 'usd_exchange_rate': 1.0 if invoice_currency_code == 'USD' else None}
+            st.success("✅ Same currency - No conversion needed")
+    
+    # Store selected currency and rates in session state
+    st.session_state.invoice_currency_code = invoice_currency_code
+    st.session_state.invoice_currency_id = invoice_currency_id
+    st.session_state.exchange_rates = rates
     
     # Invoice form
     with st.form("invoice_form"):
@@ -526,14 +579,10 @@ def show_invoice_preview():
                 key="invoice_date"
             )
             
-            # =================== PAYMENT TERMS FILTERED BY SELECTED ANs ===================
-            # Extract payment terms ONLY from selected ANs
+            # Payment terms
             unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
             
-            # Debug print
-            print(f"\n🔵 Payment terms from selected ANs: {unique_payment_terms_from_selected}")
-            
-            # Build payment term options ONLY from selected ANs
+            # Build payment term options
             term_options = {}
             default_term_name = None
             
@@ -600,7 +649,6 @@ def show_invoice_preview():
             
             if term_options[selected_term].get('description'):
                 st.caption(term_options[selected_term]['description'])
-            # =================== END PAYMENT TERMS SECTION ===================
         
         with col2:
             # Commercial Invoice input - disabled if advance payment
@@ -635,20 +683,44 @@ def show_invoice_preview():
         
         # Summary table with VAT
         st.markdown("### 📊 Invoice Summary")
-        summary_df = service.prepare_invoice_summary(selected_df)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
         
-        # Totals including VAT
-        totals = service.calculate_invoice_totals_with_vat(selected_df)
+        # Calculate amounts in selected currency
+        if po_currency_code != invoice_currency_code:
+            # Need conversion
+            converted_amounts = get_invoice_amounts_in_currency(
+                selected_df,
+                po_currency_code,
+                invoice_currency_code
+            )
+            
+            # Update selected_df display with converted amounts
+            summary_df = service.prepare_invoice_summary(selected_df)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            
+            # Show conversion info
+            st.info(f"💱 Amounts converted from {po_currency_code} to {invoice_currency_code} at rate: {format_exchange_rate(converted_amounts['exchange_rate'])}")
+            
+            totals = converted_amounts
+        else:
+            # No conversion needed
+            summary_df = service.prepare_invoice_summary(selected_df)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            
+            totals = service.calculate_invoice_totals_with_vat(selected_df)
+            totals['currency'] = invoice_currency_code
         
+        # Totals display
         col1, col2, col3 = st.columns([2, 1, 1])
         with col3:
             st.markdown("**Invoice Totals**")
-            st.text(f"Lines: {totals['total_lines']}")
-            st.text(f"Quantity: {totals['total_quantity']:,.2f}")
+            st.text(f"Lines: {len(selected_df)}")
+            st.text(f"Quantity: {selected_df['uninvoiced_quantity'].sum():,.2f}")
             st.text(f"Subtotal: {totals['subtotal']:,.2f} {totals['currency']}")
             st.text(f"VAT: {totals['total_vat']:,.2f} {totals['currency']}")
-            st.text(f"Total: {totals['total_value']:,.2f} {totals['currency']}")
+            st.text(f"Total: {totals['total_with_vat']:,.2f} {totals['currency']}")
+        
+        # Store totals for next step
+        st.session_state.invoice_totals = totals
         
         # Form actions
         st.markdown("---")
@@ -675,21 +747,31 @@ def show_invoice_preview():
             st.error("❌ Commercial Invoice Number is required for Commercial Invoices")
             return
         
-        # Prepare invoice data
+        # Get USD exchange rate
+        if invoice_currency_code == 'USD':
+            usd_rate = 1.0
+        else:
+            usd_rate = rates.get('usd_exchange_rate', 1.0)
+        
+        # Prepare invoice data with proper exchange rates
         st.session_state.invoice_data = {
             'invoice_number': invoice_number,
             'commercial_invoice_no': st.session_state.commercial_invoice_no if not st.session_state.is_advance_payment else '',
             'invoiced_date': st.session_state.invoice_date,
             'due_date': st.session_state.due_date,
-            'total_invoiced_amount': totals['total_value'],
-            'currency_id': details_df['po_currency_id'].iloc[0] if not details_df.empty else 1,
-            'usd_exchange_rate': 1.0,  # TODO: Get actual rate
+            'total_invoiced_amount': totals['total_with_vat'],
+            'currency_id': st.session_state.invoice_currency_id,
+            'usd_exchange_rate': usd_rate,
             'seller_id': details_df['vendor_id'].iloc[0] if not details_df.empty else None,
             'buyer_id': details_df['entity_id'].iloc[0] if not details_df.empty else None,
             'payment_term_id': term_options[st.session_state.payment_terms]['id'],
             'email_to_accountant': 1 if st.session_state.email_to_accountant else 0,
             'created_by': st.session_state.username,
-            'invoice_type': 'ADVANCE_PAYMENT_INVOICE' if st.session_state.is_advance_payment else 'COMMERCIAL_INVOICE'
+            'invoice_type': 'PROFORMA_INVOICE' if st.session_state.is_advance_payment else 'COMMERCIAL_INVOICE',
+            'advance_payment': 1 if st.session_state.is_advance_payment else 0,
+            'po_currency_code': po_currency_code,
+            'invoice_currency_code': invoice_currency_code,
+            'po_to_invoice_rate': rates.get('po_to_invoice_rate', 1.0)
         }
         st.session_state.wizard_step = 'confirm'
         st.rerun()
@@ -722,7 +804,7 @@ def show_invoice_confirm():
         
         with col1:
             st.markdown("#### 📋 Invoice Details")
-            invoice_type = "Advance Payment (PI)" if invoice_data.get('invoice_type') == 'ADVANCE_PAYMENT_INVOICE' else "Commercial Invoice (CI)"
+            invoice_type = "Advance Payment (PI)" if invoice_data.get('invoice_type') == 'PROFORMA_INVOICE' else "Commercial Invoice (CI)"
             st.text(f"Invoice Type: {invoice_type}")
             st.text(f"Invoice Number: {invoice_data['invoice_number']}")
             st.text(f"Invoice Date: {invoice_data['invoiced_date']}")
@@ -734,9 +816,16 @@ def show_invoice_confirm():
         with col2:
             st.markdown("#### 💰 Summary")
             st.text(f"Total Amount: {invoice_data['total_invoiced_amount']:,.2f}")
-            st.text(f"Currency: {details_df['po_currency_code'].iloc[0] if not details_df.empty else 'USD'}")
+            st.text(f"Invoice Currency: {invoice_data['invoice_currency_code']}")
+            st.text(f"PO Currency: {invoice_data['po_currency_code']}")
+            if invoice_data['po_currency_code'] != invoice_data['invoice_currency_code']:
+                st.text(f"Exchange Rate: {format_exchange_rate(invoice_data['po_to_invoice_rate'])}")
             st.text(f"Lines: {len(details_df)}")
             st.text(f"Email to Accountant: {'Yes' if invoice_data['email_to_accountant'] else 'No'}")
+    
+    # Exchange rate information
+    if invoice_data['invoice_currency_code'] != 'USD':
+        st.info(f"💱 USD Exchange Rate: 1 USD = {format_exchange_rate(invoice_data['usd_exchange_rate'])} {invoice_data['invoice_currency_code']}")
     
     # Line items
     st.markdown("### 📋 Line Items")
@@ -751,13 +840,34 @@ def show_invoice_confirm():
         how='left'
     )
     
-    # Format for display
+    # Format for display with currency conversion
     df_display = df_display[['arrival_note_number', 'po_number', 'product_name', 
                             'uninvoiced_quantity', 'buying_unit_cost', 'vat_percent']].copy()
-    df_display['vat_percent'] = df_display['vat_percent'].apply(lambda x: f"{x:.0f}%")
-    df_display.columns = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
     
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    # Convert unit costs if needed
+    if invoice_data['po_currency_code'] != invoice_data['invoice_currency_code']:
+        df_display['converted_unit_cost'] = df_display['buying_unit_cost'].apply(
+            lambda x: f"{float(x.split()[0]) * invoice_data['po_to_invoice_rate']:,.2f} {invoice_data['invoice_currency_code']}"
+        )
+        df_display['vat_percent'] = df_display['vat_percent'].apply(lambda x: f"{x:.0f}%")
+        df_display.columns = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'VAT', 'Invoice Cost']
+        display_cols = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'Invoice Cost', 'VAT']
+    else:
+        df_display['vat_percent'] = df_display['vat_percent'].apply(lambda x: f"{x:.0f}%")
+        df_display.columns = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
+        display_cols = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
+    
+    st.dataframe(df_display[display_cols], use_container_width=True, hide_index=True)
+    
+    # Show total breakdown
+    if hasattr(st.session_state, 'invoice_totals'):
+        totals = st.session_state.invoice_totals
+        col1, col2, col3 = st.columns(3)
+        with col3:
+            st.markdown("**Final Totals**")
+            st.text(f"Subtotal: {totals['subtotal']:,.2f} {totals['currency']}")
+            st.text(f"VAT: {totals['total_vat']:,.2f} {totals['currency']}")
+            st.text(f"Total: {totals['total_with_vat']:,.2f} {totals['currency']}")
     
     # Warning
     st.warning("⚠️ Please review the information above carefully. This action cannot be undone.")
@@ -772,7 +882,7 @@ def show_invoice_confirm():
     
     with col3:
         if st.button("💾 Create Invoice", type="primary", use_container_width=True):
-            # Create invoice
+            # Create invoice with proper exchange rates
             with st.spinner("Creating invoice..."):
                 success, message, invoice_id = create_purchase_invoice(
                     invoice_data,
@@ -787,14 +897,15 @@ def show_invoice_confirm():
                     
                     # Show success details
                     with st.container():
-                        invoice_type = "Advance Payment (PI)" if invoice_data.get('invoice_type') == 'ADVANCE_PAYMENT_INVOICE' else "Commercial Invoice (CI)"
+                        invoice_type = "Advance Payment (PI)" if invoice_data.get('invoice_type') == 'PROFORMA_INVOICE' else "Commercial Invoice (CI)"
                         st.info(f"""
                         **Invoice Created Successfully!**
                         - Invoice Type: {invoice_type}
                         - Invoice ID: {invoice_id}
                         - Invoice Number: {invoice_data['invoice_number']}
+                        - Currency: {invoice_data['invoice_currency_code']}
                         - Payment Terms: {payment_term_name}
-                        - Total Amount: {invoice_data['total_invoiced_amount']:,.2f}
+                        - Total Amount: {invoice_data['total_invoiced_amount']:,.2f} {invoice_data['invoice_currency_code']}
                         """)
                         
                         # Options
@@ -810,6 +921,10 @@ def show_invoice_confirm():
                                 st.session_state.selected_df = None
                                 st.session_state.current_page = 1  # Reset to first page
                                 st.session_state.is_advance_payment = False  # Reset advance payment state
+                                st.session_state.invoice_currency_code = None
+                                st.session_state.invoice_currency_id = None
+                                st.session_state.exchange_rates = None
+                                st.session_state.invoice_totals = None
                                 st.rerun()
                         
                         with col2:

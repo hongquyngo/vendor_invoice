@@ -52,7 +52,7 @@ class InvoiceService:
         totals['currency'] = currency or 'USD'
         
         return totals
-    
+
     @staticmethod
     def calculate_invoice_totals_with_vat(df: pd.DataFrame) -> Dict:
         """Calculate invoice totals including VAT breakdown"""
@@ -86,11 +86,11 @@ class InvoiceService:
         
         totals['subtotal'] = round(subtotal, 2)
         totals['total_vat'] = round(total_vat, 2)
-        totals['total_value'] = round(subtotal + total_vat, 2)
+        totals['total_with_vat'] = round(subtotal + total_vat, 2)  # Changed from 'total_value'
         totals['currency'] = currency or 'USD'
         
         return totals
-    
+
     @staticmethod
     def prepare_invoice_summary(df: pd.DataFrame) -> pd.DataFrame:
         """Prepare summary for invoice preview"""

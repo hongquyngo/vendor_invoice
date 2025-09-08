@@ -32,7 +32,7 @@ def main():
         with col1:
             date_filter = st.selectbox(
                 "Date Range",
-                ["Last 7 days", "Last 30 days", "Last 90 days", "This Month", "Custom"],
+                ["Last 7 days", "Last 30 days", "Last 90 days", "This Month", "All Time", "Custom"],
                 key="date_filter"
             )
             
@@ -54,10 +54,11 @@ def main():
             )
         
         with col3:
-            creator_search = st.text_input(
-                "Created By",
-                placeholder="Search creator...",
-                key="creator_search"
+            # Invoice Type filter
+            invoice_type_filter = st.selectbox(
+                "Invoice Type",
+                ["All", "Commercial Invoice (CI)", "Advance Payment (PI)"],
+                key="invoice_type_filter"
             )
             
             limit = st.number_input(
@@ -83,11 +84,14 @@ def main():
     if vendor_search:
         df = df[df['vendor'].str.contains(vendor_search, case=False, na=False)]
     
-    if creator_search:
-        df = df[df['created_by'].str.contains(creator_search, case=False, na=False)]
+    # Filter by invoice type
+    if invoice_type_filter == "Commercial Invoice (CI)":
+        df = df[df['invoice_number'].str.endswith('-P')]
+    elif invoice_type_filter == "Advance Payment (PI)":
+        df = df[df['invoice_number'].str.endswith('-A')]
     
     # Date filtering
-    if date_filter != "Custom":
+    if date_filter != "Custom" and date_filter != "All Time":
         today = pd.Timestamp.now()
         if date_filter == "Last 7 days":
             date_threshold = today - timedelta(days=7)
@@ -99,26 +103,53 @@ def main():
             date_threshold = today.replace(day=1)
         
         if 'date_threshold' in locals():
+            df['created_date'] = pd.to_datetime(df['created_date'])
             df = df[df['created_date'] >= date_threshold]
+    elif date_filter == "Custom":
+        if 'date_from' in locals() and 'date_to' in locals():
+            df['created_date'] = pd.to_datetime(df['created_date'])
+            df = df[(df['created_date'].dt.date >= date_from) & 
+                   (df['created_date'].dt.date <= date_to)]
     
-    # Summary metrics
+    # Add invoice type column based on suffix
+    df['invoice_type'] = df['invoice_number'].apply(
+        lambda x: 'Advance Payment' if x.endswith('-A') else 'Commercial Invoice'
+    )
+    
+    # Summary metrics by currency
     st.markdown("### 📈 Summary")
+    
+    # Group by currency for summary
+    currency_groups = df.groupby('currency')['total_invoiced_amount'].agg(['sum', 'count', 'mean'])
+    
+    # Display metrics for each currency
+    cols = st.columns(min(len(currency_groups), 4))
+    for idx, (currency, stats) in enumerate(currency_groups.iterrows()):
+        col_idx = idx % 4
+        with cols[col_idx]:
+            st.metric(
+                f"Total {currency}",
+                f"{stats['sum']:,.2f}",
+                f"{stats['count']} invoices"
+            )
+    
+    # Additional summary row
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Total Invoices", len(df))
     
     with col2:
-        total_value = df['total_invoiced_amount'].sum()
-        st.metric("Total Value", f"${total_value:,.2f}")
+        unique_vendors = df['vendor'].nunique()
+        st.metric("Unique Vendors", unique_vendors)
     
     with col3:
-        unique_vendors = df['vendor'].nunique()
-        st.metric("Vendors", unique_vendors)
+        ci_count = len(df[df['invoice_type'] == 'Commercial Invoice'])
+        st.metric("Commercial Invoices", ci_count)
     
     with col4:
-        avg_value = df['total_invoiced_amount'].mean() if len(df) > 0 else 0
-        st.metric("Avg Invoice Value", f"${avg_value:,.2f}")
+        pi_count = len(df[df['invoice_type'] == 'Advance Payment'])
+        st.metric("Advance Payments", pi_count)
     
     # Invoice table
     st.markdown("### 📋 Invoice List")
@@ -141,33 +172,41 @@ def main():
     
     # Select columns to display
     display_columns = [
-        'invoice_number', 'invoiced_date', 'vendor', 
-        'total_amount', 'line_count', 'po_count',
-        'due_date', 'created_by', 'created_date'
+        'invoice_number', 'invoice_type', 'commercial_invoice_no', 'invoiced_date', 
+        'vendor', 'total_amount', 'line_count', 'po_count',
+        'payment_term', 'due_date', 'created_by', 'created_date'
     ]
+    
+    # Remove commercial_invoice_no if not in dataframe
+    if 'commercial_invoice_no' not in df_display.columns:
+        display_columns.remove('commercial_invoice_no')
     
     # Rename columns for display
     column_mapping = {
         'invoice_number': 'Invoice #',
+        'invoice_type': 'Type',
+        'commercial_invoice_no': 'Commercial #',
         'invoiced_date': 'Invoice Date',
         'vendor': 'Vendor',
         'total_amount': 'Amount',
         'line_count': 'Lines',
         'po_count': 'POs',
+        'payment_term': 'Payment Terms',
         'due_date': 'Due Date',
         'created_by': 'Created By',
         'created_date': 'Created'
     }
     
+    # Filter columns that exist
+    display_columns = [col for col in display_columns if col in df_display.columns]
     df_display = df_display[display_columns].rename(columns=column_mapping)
     
-    # Display as dataframe with selection
-    selected = st.dataframe(
+    # Display as dataframe
+    st.dataframe(
         df_display,
         use_container_width=True,
         hide_index=True,
-        selection_mode="multi-row",
-        on_select="rerun"
+        height=400
     )
     
     # Export options
@@ -182,7 +221,7 @@ def main():
                 df_display.to_excel(writer, sheet_name='Invoices', index=False)
             
             st.download_button(
-                label="Download Excel File",
+                label="⬇️ Download Excel File",
                 data=buffer.getvalue(),
                 file_name=f"invoices_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -190,20 +229,45 @@ def main():
     
     with col2:
         # Export to CSV
-        if st.button("📄 Export to CSV", use_container_width=True):
-            csv = df_display.to_csv(index=False)
-            st.download_button(
-                label="Download CSV File",
-                data=csv,
-                file_name=f"invoices_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
+        csv = df_display.to_csv(index=False)
+        st.download_button(
+            label="📄 Download CSV",
+            data=csv,
+            file_name=f"invoices_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
     
     with col3:
-        # Selected rows info
-        if selected and selected.selection:
-            selected_count = len(selected.selection["rows"])
-            st.info(f"Selected {selected_count} invoice(s)")
+        # Summary report
+        if st.button("📊 Generate Summary Report", use_container_width=True):
+            report = f"""
+PURCHASE INVOICE SUMMARY REPORT
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+OVERALL SUMMARY:
+- Total Invoices: {len(df)}
+- Date Range: {df['invoiced_date'].min()} to {df['invoiced_date'].max()}
+- Total Vendors: {df['vendor'].nunique()}
+
+BY INVOICE TYPE:
+- Commercial Invoices: {len(df[df['invoice_type'] == 'Commercial Invoice'])}
+- Advance Payments: {len(df[df['invoice_type'] == 'Advance Payment'])}
+
+BY CURRENCY:
+"""
+            for currency, stats in currency_groups.iterrows():
+                report += f"\n{currency}:"
+                report += f"\n  - Count: {int(stats['count'])}"
+                report += f"\n  - Total: {stats['sum']:,.2f}"
+                report += f"\n  - Average: {stats['mean']:,.2f}"
+            
+            st.download_button(
+                label="⬇️ Download Report",
+                data=report,
+                file_name=f"invoice_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
 
 if __name__ == "__main__":
     main()

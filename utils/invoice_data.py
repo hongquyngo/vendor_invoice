@@ -81,7 +81,7 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
             SUBSTRING_INDEX(buying_unit_cost, ' ', -1) AS currency,
             
             -- VAT information from PO
-            ppo.vat_gst AS vat_percent,
+            COALESCE(ppo.vat_gst, 0) AS vat_percent,
             -- Calculate VAT amount
             ROUND(uninvoiced_quantity * 
                   CAST(SUBSTRING_INDEX(buying_unit_cost, ' ', 1) AS DECIMAL(15,2)) * 
@@ -368,6 +368,11 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
     """
     Create purchase invoice and details
     
+    Args:
+        invoice_data: Invoice header data
+        details_df: Invoice details dataframe
+        user_id: Username of the user creating the invoice
+    
     Returns:
         (success, message, invoice_id)
     """
@@ -375,48 +380,113 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
     
     try:
         with engine.begin() as conn:
-            # 1. Insert purchase_invoice header
-            header_query = text("""
+            # Log for debugging
+            logger.info(f"Creating invoice with payment_term_id: {invoice_data.get('payment_term_id')}")
+            
+            # Get keycloak_id from username
+            keycloak_query = text("""
+            SELECT e.keycloak_id 
+            FROM users u
+            JOIN employees e ON u.employee_id = e.id
+            WHERE u.username = :username
+            AND u.delete_flag = 0
+            """)
+            
+            keycloak_result = conn.execute(keycloak_query, {'username': user_id}).fetchone()
+            
+            if not keycloak_result:
+                logger.error(f"Could not find keycloak_id for user: {user_id}")
+                return False, f"Invalid user: {user_id}", None
+            
+            keycloak_id = keycloak_result[0]
+            logger.info(f"Found keycloak_id: {keycloak_id} for user: {user_id}")
+            
+            # Validate payment_term_id exists
+            pt_check = text("SELECT id FROM payment_terms WHERE id = :pt_id AND delete_flag = 0")
+            pt_result = conn.execute(pt_check, {'pt_id': invoice_data['payment_term_id']}).fetchone()
+            
+            if not pt_result:
+                logger.error(f"Payment term ID {invoice_data['payment_term_id']} not found")
+                return False, f"Invalid payment term ID: {invoice_data['payment_term_id']}", None
+            
+            # Prepare header data - only include non-null values
+            header_params = {
+                'invoice_number': invoice_data['invoice_number'],
+                'invoiced_date': invoice_data['invoiced_date'],
+                'due_date': invoice_data['due_date'],
+                'total_invoiced_amount': invoice_data['total_invoiced_amount'],
+                'seller_id': invoice_data['seller_id'],
+                'buyer_id': invoice_data['buyer_id'],
+                'currency_id': invoice_data['currency_id'],
+                'payment_term_id': invoice_data['payment_term_id'],
+                'created_by': keycloak_id  # Use keycloak_id instead of username
+            }
+            
+            # Add optional fields only if they have values
+            if invoice_data.get('commercial_invoice_no'):
+                header_params['commercial_invoice_no'] = invoice_data['commercial_invoice_no']
+            
+            if invoice_data.get('usd_exchange_rate') is not None:
+                header_params['usd_exchange_rate'] = invoice_data['usd_exchange_rate']
+            
+            if invoice_data.get('invoice_type'):
+                header_params['invoice_type'] = invoice_data['invoice_type']
+            
+            if invoice_data.get('email_to_accountant') is not None:
+                header_params['email_to_accountant'] = invoice_data['email_to_accountant']
+            
+            if invoice_data.get('advance_payment') is not None:
+                header_params['advance_payment'] = invoice_data['advance_payment']
+            
+            # Build INSERT query with explicit column list
+            columns = []
+            values = []
+            params_dict = {}
+            
+            for key, value in header_params.items():
+                columns.append(key)
+                values.append(f":{key}")
+                params_dict[key] = value
+            
+            header_query = text(f"""
             INSERT INTO purchase_invoices (
-                invoice_number,
-                commercial_invoice_no,
-                invoiced_date,
-                due_date,
-                total_invoiced_amount,
-                usd_exchange_rate,
-                seller_id,
-                buyer_id,
-                currency_id,
-                payment_term_id,
-                created_by,
+                {', '.join(columns)},
                 created_date,
-                delete_flag,
-                invoice_type,
-                email_to_accountant
+                delete_flag
             ) VALUES (
-                :invoice_number,
-                :commercial_invoice_no,
-                :invoiced_date,
-                :due_date,
-                :total_invoiced_amount,
-                :usd_exchange_rate,
-                :seller_id,
-                :buyer_id,
-                :currency_id,
-                :payment_term_id,
-                :created_by,
+                {', '.join(values)},
                 NOW(),
-                0,
-                :invoice_type,
-                :email_to_accountant
+                0
             )
             """)
             
-            result = conn.execute(header_query, invoice_data)
+            result = conn.execute(header_query, params_dict)
             invoice_id = result.lastrowid
             
             # 2. Insert purchase_invoice_details
             for _, row in details_df.iterrows():
+                # Extract unit cost from string format
+                unit_cost_str = row['buying_unit_cost']
+                unit_cost = float(unit_cost_str.split()[0])
+                
+                # Get exchange rate
+                po_to_invoice_rate = invoice_data.get('po_to_invoice_rate', 1.0)
+                
+                # Calculate amount
+                amount = unit_cost * row['uninvoiced_quantity'] * po_to_invoice_rate
+                
+                # Prepare detail parameters
+                detail_params = {
+                    'purchase_invoice_id': invoice_id,
+                    'purchase_order_id': row['purchase_order_id'],
+                    'product_purchase_order_id': row['product_purchase_order_id'],
+                    'arrival_detail_id': row['arrival_detail_id'],
+                    'purchased_invoice_quantity': row['uninvoiced_quantity'],
+                    'invoiced_quantity': row['uninvoiced_quantity'],
+                    'amount': amount,
+                    'exchange_rate': po_to_invoice_rate
+                }
+                
                 detail_query = text("""
                 INSERT INTO purchase_invoice_details (
                     purchase_invoice_id,
@@ -429,32 +499,19 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                     exchange_rate,
                     delete_flag
                 ) VALUES (
-                    :invoice_id,
+                    :purchase_invoice_id,
                     :purchase_order_id,
                     :product_purchase_order_id,
                     :arrival_detail_id,
                     :purchased_invoice_quantity,
                     :invoiced_quantity,
                     :amount,
-                    1.0,
+                    :exchange_rate,
                     0
                 )
                 """)
                 
-                # Extract unit cost from string format
-                unit_cost_str = row['buying_unit_cost']
-                unit_cost = float(unit_cost_str.split()[0])
-                amount = unit_cost * row['uninvoiced_quantity']
-                
-                conn.execute(detail_query, {
-                    'invoice_id': invoice_id,
-                    'purchase_order_id': row['purchase_order_id'],
-                    'product_purchase_order_id': row['product_purchase_order_id'],
-                    'arrival_detail_id': row['arrival_detail_id'],
-                    'purchased_invoice_quantity': row['uninvoiced_quantity'],
-                    'invoiced_quantity': row['uninvoiced_quantity'],  # Same for now
-                    'amount': amount
-                })
+                conn.execute(detail_query, detail_params)
             
             # Commit is handled by context manager
             return True, f"Invoice {invoice_data['invoice_number']} created successfully", invoice_id
@@ -472,13 +529,6 @@ def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: b
         C: Auto-increment number (based on max invoice ID + 1)
         D: 'A' for Advance Payment or 'P' for Commercial Invoice
     """
-    print("\n" + "="*80)
-    print("[NEW FORMAT] generate_invoice_number called!")
-    print(f"[NEW FORMAT] vendor_id: {vendor_id}, type: {type(vendor_id)}")
-    print(f"[NEW FORMAT] buyer_id: {buyer_id}, type: {type(buyer_id)}")
-    print(f"[NEW FORMAT] is_advance_payment: {is_advance_payment}")
-    print("="*80)
-    
     try:
         engine = get_db_engine()
         
@@ -486,11 +536,9 @@ def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: b
         today = datetime.now()
         date_str = today.strftime("%Y%m%d")
         
-        # Handle None values
+        # Handle None values - use 0 as placeholder
         vendor_id = int(vendor_id) if vendor_id is not None else 0
         buyer_id = int(buyer_id) if buyer_id is not None else 0
-        
-        print(f"[NEW FORMAT] Using vendor_id: {vendor_id}, buyer_id: {buyer_id}")
         
         # Get the last id from purchase_invoices table
         query = text("""
@@ -501,7 +549,6 @@ def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: b
         with engine.connect() as conn:
             result = conn.execute(query).fetchone()
             last_id = result[0] if result and result[0] else 0
-            print(f"[NEW FORMAT] Last invoice ID from database: {last_id}")
         
         # Generate sequence number (last id + 1)
         seq = last_id + 1
@@ -512,18 +559,12 @@ def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: b
         # Format: V-INVYYYYMMDD-ABC-D
         invoice_number = f"V-INV{date_str}-{vendor_id}{buyer_id}{seq}-{suffix}"
         
-        print(f"[NEW FORMAT] Generated invoice number: {invoice_number}")
-        print("="*80 + "\n")
-        
         return invoice_number
         
     except Exception as e:
-        print(f"\n[NEW FORMAT ERROR] Exception occurred: {e}")
-        print(f"[NEW FORMAT ERROR] Full traceback:")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error generating invoice number: {e}")
         
-        # Fallback format - BUT STILL NEW FORMAT
+        # Fallback format
         vendor_id = int(vendor_id) if vendor_id is not None else 0
         buyer_id = int(buyer_id) if buyer_id is not None else 0
         suffix = 'A' if is_advance_payment else 'P'
@@ -532,7 +573,6 @@ def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: b
         timestamp = datetime.now().strftime('%H%M%S')
         fallback_number = f"V-INV{datetime.now().strftime('%Y%m%d')}-{vendor_id}{buyer_id}{timestamp}-{suffix}"
         
-        print(f"[NEW FORMAT] Using fallback: {fallback_number}\n")
         return fallback_number
 
 @st.cache_data(ttl=300)
@@ -551,7 +591,7 @@ def get_recent_invoices(limit: int = 100) -> pd.DataFrame:
             pi.total_invoiced_amount,
             c.english_name AS vendor,
             curr.code AS currency,
-            pt.name AS payment_term,  -- Added payment term
+            pt.name AS payment_term,
             pi.created_by,
             pi.created_date,
             COUNT(DISTINCT pid.id) AS line_count,
@@ -559,7 +599,7 @@ def get_recent_invoices(limit: int = 100) -> pd.DataFrame:
         FROM purchase_invoices pi
         JOIN companies c ON pi.seller_id = c.id
         JOIN currencies curr ON pi.currency_id = curr.id
-        LEFT JOIN payment_terms pt ON pi.payment_term_id = pt.id  -- Join payment terms
+        LEFT JOIN payment_terms pt ON pi.payment_term_id = pt.id
         LEFT JOIN purchase_invoice_details pid ON pi.id = pid.purchase_invoice_id
         WHERE pi.delete_flag = 0
         GROUP BY pi.id
