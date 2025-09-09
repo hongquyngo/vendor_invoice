@@ -216,12 +216,83 @@ def show_an_selection():
         st.markdown("---")
         show_advanced = st.checkbox("Show Advanced Filters")
         if show_advanced:
-            vendor_types = st.multiselect(
-                "Vendor Type",
-                options=filter_options['vendor_types'],
-                placeholder="Choose an option",
-                key="filter_vendor_type"
-            )
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                vendor_types = st.multiselect(
+                    "Vendor Type",
+                    options=filter_options['vendor_types'],
+                    placeholder="Choose an option",
+                    key="filter_vendor_type"
+                )
+            
+            with col2:
+                # PO Line Status filter
+                po_statuses = st.multiselect(
+                    "PO Line Status",
+                    options=filter_options.get('po_line_statuses', []),
+                    placeholder="Choose status",
+                    key="filter_po_line_status",
+                    help="Filter by PO line completion status"
+                )
+            
+            with col3:
+                # Checkbox filters for problematic lines
+                st.markdown("**Flag Filters**")
+                show_over_delivered = st.checkbox(
+                    "Show Over-delivered Lines",
+                    key="filter_over_delivered",
+                    help="Show only PO lines with over-delivery"
+                )
+                show_over_invoiced = st.checkbox(
+                    "Show Over-invoiced Lines", 
+                    key="filter_over_invoiced",
+                    help="Show only PO lines with over-invoicing"
+                )
+            
+            # Completion percentage filters
+            st.markdown("**Completion Percentage Filters**")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                arrival_min = st.number_input(
+                    "Arrival % Min",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=None,
+                    key="filter_arrival_min",
+                    help="Minimum arrival completion percentage"
+                )
+            
+            with col2:
+                arrival_max = st.number_input(
+                    "Arrival % Max",
+                    min_value=0.0,
+                    max_value=200.0,
+                    value=None,
+                    key="filter_arrival_max",
+                    help="Maximum arrival completion percentage"
+                )
+            
+            with col3:
+                invoice_min = st.number_input(
+                    "Invoice % Min",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=None,
+                    key="filter_invoice_min",
+                    help="Minimum invoice completion percentage"
+                )
+            
+            with col4:
+                invoice_max = st.number_input(
+                    "Invoice % Max",
+                    min_value=0.0,
+                    max_value=200.0,
+                    value=None,
+                    key="filter_invoice_max",
+                    help="Maximum invoice completion percentage"
+                )
     
     # Build filters
     filters = {}
@@ -247,6 +318,22 @@ def show_an_selection():
         filters['created_date_to'] = created_date_to
     if 'filter_vendor_type' in st.session_state and st.session_state.filter_vendor_type:
         filters['vendor_types'] = st.session_state.filter_vendor_type
+    
+    # Add PO Line Status filters
+    if 'filter_po_line_status' in st.session_state and st.session_state.filter_po_line_status:
+        filters['po_line_statuses'] = st.session_state.filter_po_line_status
+    if 'filter_over_delivered' in st.session_state and st.session_state.filter_over_delivered:
+        filters['show_over_delivered'] = True
+    if 'filter_over_invoiced' in st.session_state and st.session_state.filter_over_invoiced:
+        filters['show_over_invoiced'] = True
+    if 'filter_arrival_min' in st.session_state and st.session_state.filter_arrival_min is not None:
+        filters['arrival_completion_min'] = st.session_state.filter_arrival_min
+    if 'filter_arrival_max' in st.session_state and st.session_state.filter_arrival_max is not None:
+        filters['arrival_completion_max'] = st.session_state.filter_arrival_max
+    if 'filter_invoice_min' in st.session_state and st.session_state.filter_invoice_min is not None:
+        filters['invoice_completion_min'] = st.session_state.filter_invoice_min
+    if 'filter_invoice_max' in st.session_state and st.session_state.filter_invoice_max is not None:
+        filters['invoice_completion_max'] = st.session_state.filter_invoice_max
     
     # Get data
     df = get_uninvoiced_ans(filters)
@@ -294,7 +381,7 @@ def show_an_selection():
         # Use container for scrollable area
         with st.container():
             # Header row with select all checkbox
-            cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1])
+            cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
             
             # Select all checkbox in header - now only for current page
             header_checkbox = cols[0].checkbox(
@@ -327,12 +414,13 @@ def show_an_selection():
             cols[7].markdown("**VAT**")
             cols[8].markdown("**Est. Value**")
             cols[9].markdown("**Payment**")
+            cols[10].markdown("**PO Status**")
             
             st.markdown("---")
             
             # Data rows
             for idx, row in page_df.iterrows():
-                cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1])
+                cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
                 
                 # Checkbox
                 is_selected = cols[0].checkbox(
@@ -362,6 +450,31 @@ def show_an_selection():
                 currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
                 cols[8].text(f"{row['estimated_invoice_value']:,.2f} {currency}")
                 cols[9].text(row.get('payment_term', 'N/A'))
+                
+                # Display PO Line Status with color coding
+                po_status = row.get('po_line_status', 'UNKNOWN')
+                status_color = {
+                    'COMPLETED': '🟢',
+                    'OVER_DELIVERED': '🔴',
+                    'PENDING': '⚪',
+                    'PENDING_INVOICING': '🟡',
+                    'PENDING_RECEIPT': '🟠',
+                    'IN_PROCESS': '🔵',
+                    'UNKNOWN_STATUS': '⚫'
+                }.get(po_status, '⚫')
+                
+                # Add indicators for over-delivered/over-invoiced
+                indicators = []
+                if row.get('po_line_is_over_delivered') == 'Y':
+                    indicators.append('OD')
+                if row.get('po_line_is_over_invoiced') == 'Y':
+                    indicators.append('OI')
+                
+                status_text = f"{status_color} {po_status[:8]}"
+                if indicators:
+                    status_text += f" ({','.join(indicators)})"
+                
+                cols[10].text(status_text)
         
         # Update header checkbox state based on current page selection
         page_ids = page_df['can_line_id'].tolist()
@@ -429,6 +542,34 @@ def show_an_selection():
             vat_rates = selected_df['vat_percent'].unique()
             if len(vat_rates) > 1:
                 st.info(f"ℹ️ Multiple VAT rates found: {', '.join([f'{v:.0f}%' for v in vat_rates])}. Each line will retain its respective VAT rate.")
+            
+            # Check for over-delivered/over-invoiced lines
+            if 'po_line_is_over_delivered' in selected_df.columns:
+                over_delivered = selected_df[selected_df['po_line_is_over_delivered'] == 'Y']
+                if not over_delivered.empty:
+                    st.warning(f"⚠️ {len(over_delivered)} PO line(s) have over-delivery. Please review before proceeding.")
+            
+            if 'po_line_is_over_invoiced' in selected_df.columns:
+                over_invoiced = selected_df[selected_df['po_line_is_over_invoiced'] == 'Y']
+                if not over_invoiced.empty:
+                    st.warning(f"⚠️ {len(over_invoiced)} PO line(s) have over-invoicing. Please review before proceeding.")
+            
+            # Show summary by PO line status if available
+            if 'po_line_status' in selected_df.columns:
+                status_summary = selected_df.groupby('po_line_status').size()
+                if len(status_summary) > 1 or status_summary.index[0] not in ['PENDING_INVOICING', 'IN_PROCESS']:
+                    with st.expander("📊 PO Line Status Summary"):
+                        for status, count in status_summary.items():
+                            status_emoji = {
+                                'COMPLETED': '🟢',
+                                'OVER_DELIVERED': '🔴',
+                                'PENDING': '⚪',
+                                'PENDING_INVOICING': '🟡', 
+                                'PENDING_RECEIPT': '🟠',
+                                'IN_PROCESS': '🔵',
+                                'UNKNOWN_STATUS': '⚫'
+                            }.get(status, '⚫')
+                            st.text(f"{status_emoji} {status}: {count} line(s)")
             
             # Validate selection
             is_valid, error_msg = service.can_lines_be_invoiced_together(selected_df)

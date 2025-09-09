@@ -24,7 +24,7 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
     try:
         engine = get_db_engine()
         
-        # Base query - now includes payment_term and VAT
+        # Base query - now includes payment_term, VAT, and PO line status fields
         query = """
         SELECT 
             -- AN/CAN Info
@@ -48,7 +48,7 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
             po_number,
             po_type,
             external_ref_number,
-            payment_term,  -- Added payment term
+            payment_term,  -- Payment term
             
             -- Product Info
             product_name,
@@ -91,7 +91,19 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
             ROUND(uninvoiced_quantity * 
                   CAST(SUBSTRING_INDEX(buying_unit_cost, ' ', 1) AS DECIMAL(15,2)) * 
                   (1 + COALESCE(ppo.vat_gst, 0) / 100), 2
-            ) AS total_with_vat
+            ) AS total_with_vat,
+            
+            -- PO Line Status Information
+            po_line_status,
+            po_line_is_over_delivered,
+            po_line_is_over_invoiced,
+            po_line_arrival_completion_percent,
+            po_line_invoice_completion_percent,
+            po_line_total_arrived_qty,
+            po_line_total_invoiced_buying_qty,
+            po_line_total_invoiced_standard_qty,
+            po_line_pending_invoiced_qty,
+            po_line_pending_arrival_qty
             
         FROM can_tracking_full_view can
         JOIN product_purchase_orders ppo ON can.product_purchase_order_id = ppo.id
@@ -146,6 +158,34 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
             if filters.get('po_numbers'):
                 conditions.append("po_number IN :po_numbers")
                 params['po_numbers'] = tuple(filters['po_numbers'])
+            
+            # New PO Line Status filters
+            if filters.get('po_line_statuses'):
+                conditions.append("po_line_status IN :po_line_statuses")
+                params['po_line_statuses'] = tuple(filters['po_line_statuses'])
+            
+            if filters.get('show_over_delivered'):
+                conditions.append("po_line_is_over_delivered = 'Y'")
+            
+            if filters.get('show_over_invoiced'):
+                conditions.append("po_line_is_over_invoiced = 'Y'")
+            
+            # Filter by completion percentage ranges
+            if filters.get('arrival_completion_min') is not None:
+                conditions.append("po_line_arrival_completion_percent >= :arrival_completion_min")
+                params['arrival_completion_min'] = filters['arrival_completion_min']
+            
+            if filters.get('arrival_completion_max') is not None:
+                conditions.append("po_line_arrival_completion_percent <= :arrival_completion_max")
+                params['arrival_completion_max'] = filters['arrival_completion_max']
+            
+            if filters.get('invoice_completion_min') is not None:
+                conditions.append("po_line_invoice_completion_percent >= :invoice_completion_min")
+                params['invoice_completion_min'] = filters['invoice_completion_min']
+            
+            if filters.get('invoice_completion_max') is not None:
+                conditions.append("po_line_invoice_completion_percent <= :invoice_completion_max")
+                params['invoice_completion_max'] = filters['invoice_completion_max']
         
         # Add conditions to query
         if conditions:
@@ -169,7 +209,7 @@ def get_filter_options() -> Dict:
     try:
         engine = get_db_engine()
         
-        # Get all filter options in one query
+        # Get all filter options including PO line status
         query = text("""
         SELECT 
             DISTINCT creator,
@@ -180,7 +220,8 @@ def get_filter_options() -> Dict:
             consignee,
             brand,
             arrival_note_number,
-            po_number
+            po_number,
+            po_line_status
         FROM can_tracking_full_view
         WHERE uninvoiced_quantity > 0
         """)
@@ -198,7 +239,8 @@ def get_filter_options() -> Dict:
                                for _, row in df[['consignee_code', 'consignee']].drop_duplicates().iterrows()]),
             'brands': sorted(df['brand'].dropna().unique().tolist()),
             'an_numbers': sorted(df['arrival_note_number'].dropna().unique().tolist()),
-            'po_numbers': sorted(df['po_number'].dropna().unique().tolist())
+            'po_numbers': sorted(df['po_number'].dropna().unique().tolist()),
+            'po_line_statuses': sorted(df['po_line_status'].dropna().unique().tolist())  # New field
         }
         
         return options
@@ -212,7 +254,8 @@ def get_filter_options() -> Dict:
             'entities': [],
             'brands': [],
             'an_numbers': [],
-            'po_numbers': []
+            'po_numbers': [],
+            'po_line_statuses': []
         }
 
 def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
@@ -232,7 +275,10 @@ def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
             can.buying_uom,
             can.uninvoiced_quantity,
             can.buying_unit_cost,
-            can.payment_term,  -- Added payment term from CAN view
+            can.payment_term,  -- Payment term from CAN view
+            can.po_line_status,  -- Include PO line status
+            can.po_line_is_over_delivered,
+            can.po_line_is_over_invoiced,
             po.currency_id AS po_currency_id,
             c.code AS po_currency_code,
             po.seller_company_id AS vendor_id,
@@ -361,6 +407,17 @@ def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     payment_terms = selected_df['payment_term'].dropna().unique()
     if len(payment_terms) > 1:
         return False, f"Multiple payment terms found: {', '.join(payment_terms)}. Please select ANs with the same payment terms."
+    
+    # Check for over-delivered/over-invoiced items if they exist
+    if 'po_line_is_over_delivered' in selected_df.columns:
+        over_delivered = selected_df[selected_df['po_line_is_over_delivered'] == 'Y']
+        if not over_delivered.empty:
+            logger.warning(f"Found {len(over_delivered)} over-delivered PO lines in selection")
+    
+    if 'po_line_is_over_invoiced' in selected_df.columns:
+        over_invoiced = selected_df[selected_df['po_line_is_over_invoiced'] == 'Y']
+        if not over_invoiced.empty:
+            logger.warning(f"Found {len(over_invoiced)} over-invoiced PO lines in selection")
     
     return True, ""
 
@@ -512,6 +569,15 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 """)
                 
                 conn.execute(detail_query, detail_params)
+            
+            # Log PO line status if over-delivered/over-invoiced items were included
+            if 'po_line_status' in details_df.columns:
+                problematic_lines = details_df[
+                    (details_df['po_line_is_over_delivered'] == 'Y') | 
+                    (details_df['po_line_is_over_invoiced'] == 'Y')
+                ]
+                if not problematic_lines.empty:
+                    logger.info(f"Invoice {invoice_id} includes {len(problematic_lines)} over-delivered/over-invoiced PO lines")
             
             # Commit is handled by context manager
             return True, f"Invoice {invoice_data['invoice_number']} created successfully", invoice_id
