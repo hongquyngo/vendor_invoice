@@ -15,7 +15,8 @@ from utils.invoice_data import (
     create_purchase_invoice,
     generate_invoice_number,
     get_payment_terms,
-    calculate_days_from_term_name
+    calculate_days_from_term_name,
+    get_po_line_summary  # NEW: Get PO line level data
 )
 from utils.invoice_service import InvoiceService
 from utils.currency_utils import (
@@ -54,6 +55,8 @@ if 'items_per_page' not in st.session_state:
     st.session_state.items_per_page = 50  # Default items per page
 if 'is_advance_payment' not in st.session_state:
     st.session_state.is_advance_payment = False
+if 'show_po_analysis' not in st.session_state:
+    st.session_state.show_po_analysis = False  # NEW: Toggle for PO analysis view
 
 def main():
     st.title("📝 Create Purchase Invoice")
@@ -106,7 +109,7 @@ def show_progress_indicator():
     st.markdown("---")
 
 def show_an_selection():
-    """Step 1: AN Selection"""
+    """Step 1: AN Selection with Enhanced PO Level Information"""
     
     # Filters section
     with st.expander("🔍 Filters", expanded=True):
@@ -249,6 +252,11 @@ def show_an_selection():
                     key="filter_over_invoiced",
                     help="Show only PO lines with over-invoicing"
                 )
+                show_legacy_invoices = st.checkbox(
+                    "Show Lines with Legacy Invoices",
+                    key="filter_has_legacy",
+                    help="Show PO lines that have legacy invoices without arrival mapping"
+                )
             
             # Completion percentage filters
             st.markdown("**Completion Percentage Filters**")
@@ -326,6 +334,8 @@ def show_an_selection():
         filters['show_over_delivered'] = True
     if 'filter_over_invoiced' in st.session_state and st.session_state.filter_over_invoiced:
         filters['show_over_invoiced'] = True
+    if 'filter_has_legacy' in st.session_state and st.session_state.filter_has_legacy:
+        filters['show_has_legacy'] = True
     if 'filter_arrival_min' in st.session_state and st.session_state.filter_arrival_min is not None:
         filters['arrival_completion_min'] = st.session_state.filter_arrival_min
     if 'filter_arrival_max' in st.session_state and st.session_state.filter_arrival_max is not None:
@@ -359,6 +369,14 @@ def show_an_selection():
             st.session_state.current_page = 1
             st.rerun()
     
+    with col3:
+        # NEW: Toggle for PO analysis view
+        st.session_state.show_po_analysis = st.checkbox(
+            "Show PO Analysis",
+            value=st.session_state.show_po_analysis,
+            help="Display detailed PO line level information"
+        )
+    
     if df.empty:
         st.info("No uninvoiced ANs found with the selected filters.")
     else:
@@ -380,20 +398,47 @@ def show_an_selection():
         
         # Use container for scrollable area
         with st.container():
-            # Header row with select all checkbox
-            cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
+            # Determine columns based on view mode
+            if st.session_state.show_po_analysis:
+                # Extended view with PO analysis
+                cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
+                
+                # Header
+                cols[0].checkbox("", key="header_select_all", value=st.session_state.select_all)
+                cols[1].markdown("**AN Number**")
+                cols[2].markdown("**PO Number**")
+                cols[3].markdown("**Vendor**")
+                cols[4].markdown("**Product**")
+                cols[5].markdown("**PO Qty**", help="Original PO line quantity")
+                cols[6].markdown("**PO Pend**", help="PO qty minus all invoices (legacy + new)")
+                cols[7].markdown("**AN Uninv**", help="Uninvoiced quantity from this AN")
+                cols[8].markdown("**Legacy**", help="Legacy invoices without AN mapping")
+                cols[9].markdown("**True Qty**", help="Actual remaining qty considering PO limits")
+                cols[10].markdown("**Unit Cost**")
+                cols[11].markdown("**VAT**")
+                cols[12].markdown("**Est. Value**")
+                cols[13].markdown("**Status/Risk**")
+            else:
+                # Standard view
+                cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
+                
+                # Header
+                cols[0].checkbox("", key="header_select_all", value=st.session_state.select_all)
+                cols[1].markdown("**AN Number**")
+                cols[2].markdown("**PO Number**")
+                cols[3].markdown("**Vendor**")
+                cols[4].markdown("**Product**")
+                cols[5].markdown("**Uninv Qty**")
+                cols[6].markdown("**Unit Cost**")
+                cols[7].markdown("**VAT**")
+                cols[8].markdown("**Est. Value**")
+                cols[9].markdown("**Payment**")
+                cols[10].markdown("**PO Status**")
             
-            # Select all checkbox in header - now only for current page
-            header_checkbox = cols[0].checkbox(
-                "",
-                key="header_select_all",
-                value=st.session_state.select_all
-            )
-            
-            # If header checkbox state changed, update items on current page
-            if header_checkbox != st.session_state.select_all:
-                st.session_state.select_all = header_checkbox
-                if header_checkbox:
+            # Handle select all checkbox
+            if st.session_state.header_select_all != st.session_state.select_all:
+                st.session_state.select_all = st.session_state.header_select_all
+                if st.session_state.header_select_all:
                     # Add all items from current page
                     page_ids = page_df['can_line_id'].tolist()
                     for id in page_ids:
@@ -405,76 +450,14 @@ def show_an_selection():
                     st.session_state.selected_ans = [id for id in st.session_state.selected_ans if id not in page_ids]
                 st.rerun()
             
-            cols[1].markdown("**AN Number**")
-            cols[2].markdown("**PO Number**")
-            cols[3].markdown("**Vendor**")
-            cols[4].markdown("**Product**")
-            cols[5].markdown("**Uninv Qty**")
-            cols[6].markdown("**Unit Cost**")
-            cols[7].markdown("**VAT**")
-            cols[8].markdown("**Est. Value**")
-            cols[9].markdown("**Payment**")
-            cols[10].markdown("**PO Status**")
-            
             st.markdown("---")
             
             # Data rows
             for idx, row in page_df.iterrows():
-                cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
-                
-                # Checkbox
-                is_selected = cols[0].checkbox(
-                    "",
-                    key=f"select_{row['can_line_id']}_page{st.session_state.current_page}",
-                    value=row['can_line_id'] in st.session_state.selected_ans,
-                    label_visibility="collapsed"
-                )
-                
-                if is_selected and row['can_line_id'] not in st.session_state.selected_ans:
-                    st.session_state.selected_ans.append(row['can_line_id'])
-                elif not is_selected and row['can_line_id'] in st.session_state.selected_ans:
-                    st.session_state.selected_ans.remove(row['can_line_id'])
-                
-                # Display data
-                cols[1].text(row['arrival_note_number'])
-                cols[2].text(row['po_number'])
-                cols[3].text(f"{row['vendor_code']} - {row['vendor']}")
-                cols[4].text(f"{row['pt_code']} - {row['product_name']}")
-                cols[5].text(f"{row['uninvoiced_quantity']:.2f} {row['buying_uom']}")
-                cols[6].text(row['buying_unit_cost'])
-                
-                # Display VAT
-                vat_percent = row.get('vat_percent', 0)
-                cols[7].text(f"{vat_percent:.0f}%")
-                
-                currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
-                cols[8].text(f"{row['estimated_invoice_value']:,.2f} {currency}")
-                cols[9].text(row.get('payment_term', 'N/A'))
-                
-                # Display PO Line Status with color coding
-                po_status = row.get('po_line_status', 'UNKNOWN')
-                status_color = {
-                    'COMPLETED': '🟢',
-                    'OVER_DELIVERED': '🔴',
-                    'PENDING': '⚪',
-                    'PENDING_INVOICING': '🟡',
-                    'PENDING_RECEIPT': '🟠',
-                    'IN_PROCESS': '🔵',
-                    'UNKNOWN_STATUS': '⚫'
-                }.get(po_status, '⚫')
-                
-                # Add indicators for over-delivered/over-invoiced
-                indicators = []
-                if row.get('po_line_is_over_delivered') == 'Y':
-                    indicators.append('OD')
-                if row.get('po_line_is_over_invoiced') == 'Y':
-                    indicators.append('OI')
-                
-                status_text = f"{status_color} {po_status[:8]}"
-                if indicators:
-                    status_text += f" ({','.join(indicators)})"
-                
-                cols[10].text(status_text)
+                if st.session_state.show_po_analysis:
+                    display_row_with_po_analysis(row)
+                else:
+                    display_standard_row(row)
         
         # Update header checkbox state based on current page selection
         page_ids = page_df['can_line_id'].tolist()
@@ -519,6 +502,14 @@ def show_an_selection():
         if st.session_state.selected_ans:
             # Get selected items from full dataframe
             selected_df = df[df['can_line_id'].isin(st.session_state.selected_ans)]
+            
+            # NEW: Get PO line summary for risk analysis
+            if 'product_purchase_order_id' in selected_df.columns:
+                po_line_ids = selected_df['product_purchase_order_id'].unique().tolist()
+                po_summary_df = get_po_line_summary(po_line_ids)
+            else:
+                po_summary_df = pd.DataFrame()
+            
             totals = service.calculate_invoice_totals(selected_df)
             
             st.markdown("---")
@@ -532,6 +523,52 @@ def show_an_selection():
             if 'vat_amount' in selected_df.columns:
                 total_vat = selected_df['vat_amount'].sum()
                 col5.metric("Total VAT", f"{total_vat:,.2f} {totals['currency']}")
+            
+            # NEW: Show PO Line Risk Analysis
+            if st.session_state.show_po_analysis and not po_summary_df.empty:
+                with st.expander("📊 PO Line Risk Analysis", expanded=True):
+                    for _, po_line in po_summary_df.iterrows():
+                        col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 1])
+                        
+                        with col1:
+                            st.markdown(f"**PO #{po_line['po_number']} - {po_line['product_name'][:30]}**")
+                            st.text(f"PO Line ID: {po_line['product_purchase_order_id']}")
+                        
+                        with col2:
+                            st.text(f"PO Qty: {po_line.get('po_buying_qty', 0):.0f}")
+                            st.text(f"PO Pending: {po_line.get('po_remaining_qty', 0):.0f}")
+                            st.text(f"Legacy Inv: {po_line.get('legacy_invoice_qty', 0):.0f}")
+                        
+                        with col3:
+                            selected_for_po = selected_df[selected_df['product_purchase_order_id'] == po_line['product_purchase_order_id']]
+                            selected_qty = selected_for_po['uninvoiced_quantity'].sum()
+                            
+                            st.text(f"Selected AN: {selected_qty:.0f}")
+                            remaining_after = po_line.get('po_remaining_qty', 0) - selected_qty
+                            st.text(f"After Invoice: {remaining_after:.0f}")
+                            
+                            # Show percentage
+                            if po_line.get('po_buying_qty', 0) > 0:
+                                completion = ((po_line.get('po_buying_qty', 0) - remaining_after) / po_line.get('po_buying_qty', 0)) * 100
+                                st.text(f"Completion: {completion:.1f}%")
+                        
+                        with col4:
+                            # Risk indicators
+                            risks = []
+                            if po_line.get('legacy_invoice_qty', 0) > 0:
+                                risks.append("⚠️ Has Legacy")
+                            if selected_qty > po_line.get('po_remaining_qty', 0):
+                                risks.append("🔴 Exceeds PO")
+                            if 'completion' in locals() and completion > 95:
+                                risks.append("⚠️ Near Complete")
+                            
+                            if risks:
+                                for risk in risks:
+                                    st.text(risk)
+                            else:
+                                st.success("✅ No risks")
+                        
+                        st.markdown("---")
             
             # Show warnings if any
             payment_terms = selected_df['payment_term'].dropna().unique()
@@ -554,36 +591,161 @@ def show_an_selection():
                 if not over_invoiced.empty:
                     st.warning(f"⚠️ {len(over_invoiced)} PO line(s) have over-invoicing. Please review before proceeding.")
             
-            # Show summary by PO line status if available
-            if 'po_line_status' in selected_df.columns:
-                status_summary = selected_df.groupby('po_line_status').size()
-                if len(status_summary) > 1 or status_summary.index[0] not in ['PENDING_INVOICING', 'IN_PROCESS']:
-                    with st.expander("📊 PO Line Status Summary"):
-                        for status, count in status_summary.items():
-                            status_emoji = {
-                                'COMPLETED': '🟢',
-                                'OVER_DELIVERED': '🔴',
-                                'PENDING': '⚪',
-                                'PENDING_INVOICING': '🟡', 
-                                'PENDING_RECEIPT': '🟠',
-                                'IN_PROCESS': '🔵',
-                                'UNKNOWN_STATUS': '⚫'
-                            }.get(status, '⚫')
-                            st.text(f"{status_emoji} {status}: {count} line(s)")
+            # NEW: Check for legacy invoices
+            if 'has_legacy_invoices' in selected_df.columns:
+                has_legacy = selected_df[selected_df['has_legacy_invoices'] == 'Y']
+                if not has_legacy.empty:
+                    st.warning(f"⚠️ {len(has_legacy)} PO line(s) have legacy invoices. True remaining quantities will be calculated.")
             
             # Validate selection
-            is_valid, error_msg = service.can_lines_be_invoiced_together(selected_df)
+            is_valid, error_msg = validate_invoice_selection(selected_df)
             
             st.markdown("---")
             if not is_valid:
                 st.error(f"❌ {error_msg}")
             else:
-                st.success("✅ Selected items can be invoiced together")
-                if st.button("➡️ Proceed to Preview", type="primary", use_container_width=True):
-                    # Store selected data
-                    st.session_state.selected_df = selected_df
-                    st.session_state.wizard_step = 'preview'
-                    st.rerun()
+                # NEW: Enhanced validation with PO level checks
+                validation_result, validation_msgs = service.validate_invoice_with_po_level(selected_df)
+                
+                if not validation_result['can_invoice']:
+                    st.error(f"❌ {validation_msgs['error']}")
+                else:
+                    if validation_msgs.get('warnings'):
+                        for warning in validation_msgs['warnings']:
+                            st.warning(f"⚠️ {warning}")
+                    
+                    st.success("✅ Selected items can be invoiced together")
+                    
+                    if st.button("➡️ Proceed to Preview", type="primary", use_container_width=True):
+                        # Store selected data
+                        st.session_state.selected_df = selected_df
+                        st.session_state.wizard_step = 'preview'
+                        st.rerun()
+
+def display_standard_row(row):
+    """Display standard row without PO analysis"""
+    cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
+    
+    # Checkbox
+    is_selected = cols[0].checkbox(
+        "",
+        key=f"select_{row['can_line_id']}_page{st.session_state.current_page}",
+        value=row['can_line_id'] in st.session_state.selected_ans,
+        label_visibility="collapsed"
+    )
+    
+    if is_selected and row['can_line_id'] not in st.session_state.selected_ans:
+        st.session_state.selected_ans.append(row['can_line_id'])
+    elif not is_selected and row['can_line_id'] in st.session_state.selected_ans:
+        st.session_state.selected_ans.remove(row['can_line_id'])
+    
+    # Display data
+    cols[1].text(row['arrival_note_number'])
+    cols[2].text(row['po_number'])
+    cols[3].text(f"{row['vendor_code']} - {row['vendor'][:20]}")
+    cols[4].text(f"{row['pt_code']} - {row['product_name'][:20]}")
+    cols[5].text(f"{row['uninvoiced_quantity']:.2f} {row['buying_uom']}")
+    cols[6].text(row['buying_unit_cost'])
+    
+    # VAT
+    vat_percent = row.get('vat_percent', 0)
+    cols[7].text(f"{vat_percent:.0f}%")
+    
+    # Estimated value
+    currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
+    cols[8].text(f"{row['estimated_invoice_value']:,.2f} {currency}")
+    cols[9].text(row.get('payment_term', 'N/A'))
+    
+    # PO Status with risk indicators
+    po_status = row.get('po_line_status', 'UNKNOWN')
+    status_color = get_status_color(po_status)
+    
+    # Add risk indicators
+    indicators = []
+    if row.get('po_line_is_over_delivered') == 'Y':
+        indicators.append('OD')
+    if row.get('po_line_is_over_invoiced') == 'Y':
+        indicators.append('OI')
+    if row.get('has_legacy_invoices') == 'Y':
+        indicators.append('LEG')
+    
+    status_text = f"{status_color} {po_status[:8]}"
+    if indicators:
+        status_text += f" ({','.join(indicators)})"
+    
+    cols[10].text(status_text)
+
+def display_row_with_po_analysis(row):
+    """Display row with detailed PO analysis"""
+    cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
+    
+    # Checkbox
+    is_selected = cols[0].checkbox(
+        "",
+        key=f"select_{row['can_line_id']}_page{st.session_state.current_page}",
+        value=row['can_line_id'] in st.session_state.selected_ans,
+        label_visibility="collapsed"
+    )
+    
+    if is_selected and row['can_line_id'] not in st.session_state.selected_ans:
+        st.session_state.selected_ans.append(row['can_line_id'])
+    elif not is_selected and row['can_line_id'] in st.session_state.selected_ans:
+        st.session_state.selected_ans.remove(row['can_line_id'])
+    
+    # Basic info
+    cols[1].text(row['arrival_note_number'][:10])
+    cols[2].text(row['po_number'][:10])
+    cols[3].text(f"{row['vendor_code'][:3]}-{row['vendor'][:12]}")
+    cols[4].text(f"{row['pt_code'][:8]}-{row['product_name'][:12]}")
+    
+    # PO and Quantity analysis
+    po_qty = row.get('po_buying_quantity', 0)
+    po_pending = row.get('po_line_pending_invoiced_qty', 0)
+    an_uninv = row['uninvoiced_quantity']
+    legacy_qty = row.get('legacy_invoice_qty', 0)
+    true_remaining = row.get('true_remaining_qty', an_uninv)
+    
+    cols[5].text(f"{po_qty:.0f}")
+    cols[6].text(f"{po_pending:.0f}")
+    cols[7].text(f"{an_uninv:.0f}")
+    cols[8].text(f"{legacy_qty:.0f}" if legacy_qty > 0 else "-")
+    cols[9].text(f"{true_remaining:.0f}")
+    
+    # Cost info
+    cols[10].text(row['buying_unit_cost'].split()[0][:6])
+    vat_percent = row.get('vat_percent', 0)
+    cols[11].text(f"{vat_percent:.0f}%")
+    
+    # Estimated value
+    currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
+    cols[12].text(f"{row['estimated_invoice_value']:,.0f}")
+    
+    # Risk status
+    risk_status = []
+    if row.get('po_line_is_over_delivered') == 'Y':
+        risk_status.append("🔴OD")
+    if row.get('po_line_is_over_invoiced') == 'Y':
+        risk_status.append("🔴OI")
+    if legacy_qty > 0:
+        risk_status.append("⚠️LEG")
+    if true_remaining < an_uninv:
+        risk_status.append("⚠️ADJ")
+    if po_pending < an_uninv:
+        risk_status.append("⚠️EXC")  # Exceeds PO pending
+    
+    cols[13].text(" ".join(risk_status) if risk_status else "✅OK")
+
+def get_status_color(status):
+    """Get status color emoji"""
+    return {
+        'COMPLETED': '🟢',
+        'OVER_DELIVERED': '🔴',
+        'PENDING': '⚪',
+        'PENDING_INVOICING': '🟡',
+        'PENDING_RECEIPT': '🟠',
+        'IN_PROCESS': '🔵',
+        'UNKNOWN_STATUS': '⚫'
+    }.get(status, '⚫')
 
 def show_invoice_preview():
     """Step 2: Invoice Preview"""
