@@ -16,12 +16,13 @@ from utils.invoice_data import (
     generate_invoice_number,
     get_payment_terms,
     calculate_days_from_term_name,
-    get_po_line_summary  # NEW: Get PO line level data
+    get_po_line_summary
 )
 from utils.invoice_service import InvoiceService
 from utils.currency_utils import (
     get_available_currencies,
     calculate_exchange_rates,
+    validate_exchange_rates,
     format_exchange_rate,
     get_invoice_amounts_in_currency
 )
@@ -42,7 +43,7 @@ service = InvoiceService()
 if 'selected_ans' not in st.session_state:
     st.session_state.selected_ans = []
 if 'wizard_step' not in st.session_state:
-    st.session_state.wizard_step = 'select'  # 'select', 'preview', 'confirm'
+    st.session_state.wizard_step = 'select'
 if 'select_all' not in st.session_state:
     st.session_state.select_all = False
 if 'invoice_data' not in st.session_state:
@@ -52,11 +53,15 @@ if 'details_df' not in st.session_state:
 if 'current_page' not in st.session_state:
     st.session_state.current_page = 1
 if 'items_per_page' not in st.session_state:
-    st.session_state.items_per_page = 50  # Default items per page
+    st.session_state.items_per_page = 50
 if 'is_advance_payment' not in st.session_state:
     st.session_state.is_advance_payment = False
 if 'show_po_analysis' not in st.session_state:
-    st.session_state.show_po_analysis = False  # NEW: Toggle for PO analysis view
+    st.session_state.show_po_analysis = False
+if 'invoice_creating' not in st.session_state:
+    st.session_state.invoice_creating = False
+if 'last_created_invoice' not in st.session_state:
+    st.session_state.last_created_invoice = None
 
 def main():
     st.title("📝 Create Purchase Invoice")
@@ -110,6 +115,20 @@ def show_progress_indicator():
 
 def show_an_selection():
     """Step 1: AN Selection with Enhanced PO Level Information"""
+    
+    # Show success message if just created an invoice
+    if st.session_state.last_created_invoice:
+        invoice_info = st.session_state.last_created_invoice
+        st.success(f"""
+        ✅ **Invoice Created Successfully!**
+        - Invoice Number: {invoice_info['number']}
+        - Invoice ID: {invoice_info['id']}
+        - Total Amount: {invoice_info['amount']:,.2f} {invoice_info['currency']}
+        """)
+        
+        # Clear the message after showing
+        st.session_state.last_created_invoice = None
+        st.markdown("---")
     
     # Filters section
     with st.expander("🔍 Filters", expanded=True):
@@ -208,11 +227,11 @@ def show_an_selection():
         with col5:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🔄 Reset Filters", use_container_width=True):
-                for key in st.session_state:
+                for key in list(st.session_state.keys()):
                     if key.startswith('filter_'):
                         del st.session_state[key]
                 st.session_state.select_all = False
-                st.session_state.current_page = 1  # Reset to first page
+                st.session_state.current_page = 1
                 st.rerun()
         
         # Advanced filters
@@ -230,7 +249,6 @@ def show_an_selection():
                 )
             
             with col2:
-                # PO Line Status filter
                 po_statuses = st.multiselect(
                     "PO Line Status",
                     options=filter_options.get('po_line_statuses', []),
@@ -240,7 +258,6 @@ def show_an_selection():
                 )
             
             with col3:
-                # Checkbox filters for problematic lines
                 st.markdown("**Flag Filters**")
                 show_over_delivered = st.checkbox(
                     "Show Over-delivered Lines",
@@ -326,8 +343,6 @@ def show_an_selection():
         filters['created_date_to'] = created_date_to
     if 'filter_vendor_type' in st.session_state and st.session_state.filter_vendor_type:
         filters['vendor_types'] = st.session_state.filter_vendor_type
-    
-    # Add PO Line Status filters
     if 'filter_po_line_status' in st.session_state and st.session_state.filter_po_line_status:
         filters['po_line_statuses'] = st.session_state.filter_po_line_status
     if 'filter_over_delivered' in st.session_state and st.session_state.filter_over_delivered:
@@ -370,7 +385,6 @@ def show_an_selection():
             st.rerun()
     
     with col3:
-        # NEW: Toggle for PO analysis view
         st.session_state.show_po_analysis = st.checkbox(
             "Show PO Analysis",
             value=st.session_state.show_po_analysis,
@@ -400,7 +414,6 @@ def show_an_selection():
         with st.container():
             # Determine columns based on view mode
             if st.session_state.show_po_analysis:
-                # Extended view with PO analysis
                 cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
                 
                 # Header
@@ -419,7 +432,6 @@ def show_an_selection():
                 cols[12].markdown("**Est. Value**")
                 cols[13].markdown("**Status/Risk**")
             else:
-                # Standard view
                 cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
                 
                 # Header
@@ -439,13 +451,11 @@ def show_an_selection():
             if st.session_state.header_select_all != st.session_state.select_all:
                 st.session_state.select_all = st.session_state.header_select_all
                 if st.session_state.header_select_all:
-                    # Add all items from current page
                     page_ids = page_df['can_line_id'].tolist()
                     for id in page_ids:
                         if id not in st.session_state.selected_ans:
                             st.session_state.selected_ans.append(id)
                 else:
-                    # Remove all items from current page
                     page_ids = page_df['can_line_id'].tolist()
                     st.session_state.selected_ans = [id for id in st.session_state.selected_ans if id not in page_ids]
                 st.rerun()
@@ -500,10 +510,8 @@ def show_an_selection():
         
         # Summary and actions
         if st.session_state.selected_ans:
-            # Get selected items from full dataframe
             selected_df = df[df['can_line_id'].isin(st.session_state.selected_ans)]
             
-            # NEW: Get PO line summary for risk analysis
             if 'product_purchase_order_id' in selected_df.columns:
                 po_line_ids = selected_df['product_purchase_order_id'].unique().tolist()
                 po_summary_df = get_po_line_summary(po_line_ids)
@@ -519,12 +527,11 @@ def show_an_selection():
             col3.metric("Total Lines", totals['total_lines'])
             col4.metric("Est. Total Value", f"{totals['total_value']:,.2f} {totals['currency']}")
             
-            # Show total VAT amount
             if 'vat_amount' in selected_df.columns:
                 total_vat = selected_df['vat_amount'].sum()
                 col5.metric("Total VAT", f"{total_vat:,.2f} {totals['currency']}")
             
-            # NEW: Show PO Line Risk Analysis
+            # Show PO Line Risk Analysis
             if st.session_state.show_po_analysis and not po_summary_df.empty:
                 with st.expander("📊 PO Line Risk Analysis", expanded=True):
                     for _, po_line in po_summary_df.iterrows():
@@ -547,13 +554,11 @@ def show_an_selection():
                             remaining_after = po_line.get('po_remaining_qty', 0) - selected_qty
                             st.text(f"After Invoice: {remaining_after:.0f}")
                             
-                            # Show percentage
                             if po_line.get('po_buying_qty', 0) > 0:
                                 completion = ((po_line.get('po_buying_qty', 0) - remaining_after) / po_line.get('po_buying_qty', 0)) * 100
                                 st.text(f"Completion: {completion:.1f}%")
                         
                         with col4:
-                            # Risk indicators
                             risks = []
                             if po_line.get('legacy_invoice_qty', 0) > 0:
                                 risks.append("⚠️ Has Legacy")
@@ -570,17 +575,15 @@ def show_an_selection():
                         
                         st.markdown("---")
             
-            # Show warnings if any
+            # Show warnings
             payment_terms = selected_df['payment_term'].dropna().unique()
             if len(payment_terms) > 1:
                 st.warning(f"⚠️ Multiple payment terms found: {', '.join(payment_terms)}. The most common term will be used.")
             
-            # Check for multiple VAT rates
             vat_rates = selected_df['vat_percent'].unique()
             if len(vat_rates) > 1:
                 st.info(f"ℹ️ Multiple VAT rates found: {', '.join([f'{v:.0f}%' for v in vat_rates])}. Each line will retain its respective VAT rate.")
             
-            # Check for over-delivered/over-invoiced lines
             if 'po_line_is_over_delivered' in selected_df.columns:
                 over_delivered = selected_df[selected_df['po_line_is_over_delivered'] == 'Y']
                 if not over_delivered.empty:
@@ -591,7 +594,6 @@ def show_an_selection():
                 if not over_invoiced.empty:
                     st.warning(f"⚠️ {len(over_invoiced)} PO line(s) have over-invoicing. Please review before proceeding.")
             
-            # NEW: Check for legacy invoices
             if 'has_legacy_invoices' in selected_df.columns:
                 has_legacy = selected_df[selected_df['has_legacy_invoices'] == 'Y']
                 if not has_legacy.empty:
@@ -604,7 +606,6 @@ def show_an_selection():
             if not is_valid:
                 st.error(f"❌ {error_msg}")
             else:
-                # NEW: Enhanced validation with PO level checks
                 validation_result, validation_msgs = service.validate_invoice_with_po_level(selected_df)
                 
                 if not validation_result['can_invoice']:
@@ -617,7 +618,6 @@ def show_an_selection():
                     st.success("✅ Selected items can be invoiced together")
                     
                     if st.button("➡️ Proceed to Preview", type="primary", use_container_width=True):
-                        # Store selected data
                         st.session_state.selected_df = selected_df
                         st.session_state.wizard_step = 'preview'
                         st.rerun()
@@ -626,7 +626,6 @@ def display_standard_row(row):
     """Display standard row without PO analysis"""
     cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
     
-    # Checkbox
     is_selected = cols[0].checkbox(
         "",
         key=f"select_{row['can_line_id']}_page{st.session_state.current_page}",
@@ -639,7 +638,6 @@ def display_standard_row(row):
     elif not is_selected and row['can_line_id'] in st.session_state.selected_ans:
         st.session_state.selected_ans.remove(row['can_line_id'])
     
-    # Display data
     cols[1].text(row['arrival_note_number'])
     cols[2].text(row['po_number'])
     cols[3].text(f"{row['vendor_code']} - {row['vendor'][:20]}")
@@ -647,20 +645,16 @@ def display_standard_row(row):
     cols[5].text(f"{row['uninvoiced_quantity']:.2f} {row['buying_uom']}")
     cols[6].text(row['buying_unit_cost'])
     
-    # VAT
     vat_percent = row.get('vat_percent', 0)
     cols[7].text(f"{vat_percent:.0f}%")
     
-    # Estimated value
     currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
     cols[8].text(f"{row['estimated_invoice_value']:,.2f} {currency}")
     cols[9].text(row.get('payment_term', 'N/A'))
     
-    # PO Status with risk indicators
     po_status = row.get('po_line_status', 'UNKNOWN')
     status_color = get_status_color(po_status)
     
-    # Add risk indicators
     indicators = []
     if row.get('po_line_is_over_delivered') == 'Y':
         indicators.append('OD')
@@ -679,7 +673,6 @@ def display_row_with_po_analysis(row):
     """Display row with detailed PO analysis"""
     cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
     
-    # Checkbox
     is_selected = cols[0].checkbox(
         "",
         key=f"select_{row['can_line_id']}_page{st.session_state.current_page}",
@@ -692,13 +685,11 @@ def display_row_with_po_analysis(row):
     elif not is_selected and row['can_line_id'] in st.session_state.selected_ans:
         st.session_state.selected_ans.remove(row['can_line_id'])
     
-    # Basic info
     cols[1].text(row['arrival_note_number'][:10])
     cols[2].text(row['po_number'][:10])
     cols[3].text(f"{row['vendor_code'][:3]}-{row['vendor'][:12]}")
     cols[4].text(f"{row['pt_code'][:8]}-{row['product_name'][:12]}")
     
-    # PO and Quantity analysis
     po_qty = row.get('po_buying_quantity', 0)
     po_pending = row.get('po_line_pending_invoiced_qty', 0)
     an_uninv = row['uninvoiced_quantity']
@@ -711,16 +702,13 @@ def display_row_with_po_analysis(row):
     cols[8].text(f"{legacy_qty:.0f}" if legacy_qty > 0 else "-")
     cols[9].text(f"{true_remaining:.0f}")
     
-    # Cost info
     cols[10].text(row['buying_unit_cost'].split()[0][:6])
     vat_percent = row.get('vat_percent', 0)
     cols[11].text(f"{vat_percent:.0f}%")
     
-    # Estimated value
     currency = row['buying_unit_cost'].split()[-1] if ' ' in str(row['buying_unit_cost']) else 'USD'
     cols[12].text(f"{row['estimated_invoice_value']:,.0f}")
     
-    # Risk status
     risk_status = []
     if row.get('po_line_is_over_delivered') == 'Y':
         risk_status.append("🔴OD")
@@ -731,7 +719,7 @@ def display_row_with_po_analysis(row):
     if true_remaining < an_uninv:
         risk_status.append("⚠️ADJ")
     if po_pending < an_uninv:
-        risk_status.append("⚠️EXC")  # Exceeds PO pending
+        risk_status.append("⚠️EXC")
     
     cols[13].text(" ".join(risk_status) if risk_status else "✅OK")
 
@@ -748,9 +736,8 @@ def get_status_color(status):
     }.get(status, '⚫')
 
 def show_invoice_preview():
-    """Step 2: Invoice Preview"""
+    """Step 2: Invoice Preview with Enhanced Exchange Rate Handling"""
     
-    # Check if we have selected data
     if 'selected_df' not in st.session_state or st.session_state.selected_df is None:
         st.error("No data found. Please go back and select ANs.")
         if st.button("⬅️ Back to Selection"):
@@ -760,7 +747,6 @@ def show_invoice_preview():
     
     selected_df = st.session_state.selected_df
     
-    # Get detailed info
     with st.spinner("Loading invoice details..."):
         details_df = get_invoice_details(st.session_state.selected_ans)
     
@@ -771,19 +757,14 @@ def show_invoice_preview():
             st.rerun()
         return
     
-    # Store details for next step
     st.session_state.details_df = details_df
     
-    # Get PO currency info
     po_currency_id = details_df['po_currency_id'].iloc[0] if not details_df.empty else 1
     po_currency_code = details_df['po_currency_code'].iloc[0] if not details_df.empty else 'USD'
     
-    # Invoice header section
     st.markdown("### 📄 Invoice Information")
     
-    # Initialize session state for payment term if not exists
     if 'selected_payment_term' not in st.session_state:
-        # Get initial payment term
         unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
         if unique_payment_terms_from_selected:
             most_common_term = selected_df['payment_term'].mode()
@@ -794,18 +775,14 @@ def show_invoice_preview():
         else:
             st.session_state.selected_payment_term = 'Net 30'
     
-    # Initialize invoice date in session state if not exists
     if 'invoice_date' not in st.session_state:
         st.session_state.invoice_date = date.today()
     
-    # Advance Payment checkbox - OUTSIDE THE FORM for immediate refresh
     col1, col2 = st.columns(2)
     
     with col1:
-        # Store current state
         current_advance_state = st.session_state.is_advance_payment
         
-        # Checkbox outside form
         advance_payment = st.checkbox(
             "Advance Payment Invoice",
             value=st.session_state.is_advance_payment,
@@ -813,29 +790,24 @@ def show_invoice_preview():
             help="Check this for advance payment invoices (PI). This will change the invoice number suffix."
         )
         
-        # Check if state changed and trigger refresh
         if advance_payment != current_advance_state:
             st.session_state.is_advance_payment = advance_payment
             st.rerun()
     
-    # Generate invoice number based on current advance payment state
     vendor_code = selected_df['vendor_code'].iloc[0]
     vendor_id = details_df['vendor_id'].iloc[0] if not details_df.empty else None
     buyer_id = details_df['entity_id'].iloc[0] if not details_df.empty else None
     
     invoice_number = generate_invoice_number(vendor_id, buyer_id, st.session_state.is_advance_payment)
     
-    # Show invoice type indicator
     with col2:
         if st.session_state.is_advance_payment:
             st.info("🔵 **Invoice Type: Advance Payment (PI)**")
         else:
             st.success("🟢 **Invoice Type: Commercial Invoice (CI)**")
     
-    # Currency selection section
     st.markdown("### 💱 Currency Selection")
     
-    # Get available currencies
     currencies_df = get_available_currencies()
     
     col1, col2, col3 = st.columns(3)
@@ -844,11 +816,9 @@ def show_invoice_preview():
         st.info(f"**PO Currency:** {po_currency_code}")
     
     with col2:
-        # Currency selection dropdown
         currency_options = currencies_df['code'].tolist()
         currency_display = [f"{row['code']} - {row['name']}" for _, row in currencies_df.iterrows()]
         
-        # Default to PO currency if available, otherwise USD
         default_index = 0
         if po_currency_code in currency_options:
             default_index = currency_options.index(po_currency_code)
@@ -863,42 +833,59 @@ def show_invoice_preview():
             help="Select the currency for this invoice"
         )
         
-        # Extract currency code
         invoice_currency_code = selected_currency_display.split(' - ')[0]
         invoice_currency_id = currencies_df[currencies_df['code'] == invoice_currency_code]['id'].iloc[0]
     
     with col3:
-        # Calculate and display exchange rates
+        # Always calculate exchange rates (including USD rate)
+        with st.spinner("Fetching exchange rates..."):
+            rates = calculate_exchange_rates(po_currency_code, invoice_currency_code)
+        
+        # Validate rates
+        rates_valid, rate_warnings = validate_exchange_rates(rates, po_currency_code, invoice_currency_code)
+        
+        st.markdown("**Exchange Rates:**")
+        
+        # Show PO to Invoice rate if different currencies
         if po_currency_code != invoice_currency_code:
-            with st.spinner("Fetching exchange rates..."):
-                rates = calculate_exchange_rates(po_currency_code, invoice_currency_code)
-            
-            st.markdown("**Exchange Rates:**")
-            st.text(f"1 {po_currency_code} = {format_exchange_rate(rates['po_to_invoice_rate'])} {invoice_currency_code}")
-            if invoice_currency_code != 'USD':
-                st.text(f"1 USD = {format_exchange_rate(rates['usd_exchange_rate'])} {invoice_currency_code}")
+            if rates['po_to_invoice_rate'] is not None:
+                st.text(f"1 {po_currency_code} = {format_exchange_rate(rates['po_to_invoice_rate'])} {invoice_currency_code}")
+            else:
+                st.error(f"⚠️ Could not fetch {po_currency_code}/{invoice_currency_code} rate")
         else:
-            rates = {'po_to_invoice_rate': 1.0, 'usd_exchange_rate': 1.0 if invoice_currency_code == 'USD' else None}
             st.success("✅ Same currency - No conversion needed")
+        
+        # Always show USD rate (important for reporting)
+        if invoice_currency_code != 'USD':
+            if rates['usd_exchange_rate'] is not None:
+                st.text(f"1 USD = {format_exchange_rate(rates['usd_exchange_rate'])} {invoice_currency_code}")
+            else:
+                st.warning("⚠️ USD exchange rate not available")
+        else:
+            st.info("💵 Invoice currency is USD")
     
-    # Store selected currency and rates in session state
+    # Show validation warnings if any
+    if not rates_valid:
+        st.error("❌ Required exchange rates not available. Cannot proceed with invoice.")
+        for warning in rate_warnings:
+            st.error(f"• {warning}")
+        return
+    elif rate_warnings:
+        for warning in rate_warnings:
+            st.warning(f"⚠️ {warning}")
+    
     st.session_state.invoice_currency_code = invoice_currency_code
     st.session_state.invoice_currency_id = invoice_currency_id
     st.session_state.exchange_rates = rates
     
-    # Build payment term options BEFORE the form
     unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
     
-    # Build payment term options
     term_options = {}
     
     if unique_payment_terms_from_selected:
-        # Get all payment terms data for reference
         all_payment_terms_df = get_payment_terms()
         
-        # Build options from selected AN payment terms
         for term_name in unique_payment_terms_from_selected:
-            # Look up in database
             db_match = all_payment_terms_df[all_payment_terms_df['name'] == term_name]
             
             if not db_match.empty:
@@ -909,12 +896,9 @@ def show_invoice_preview():
                     'description': row.get('description', '')
                 }
             else:
-                # Not in database - calculate days and use a default ID
                 days = calculate_days_from_term_name(term_name)
-                # Try to find ID from details_df if available
-                term_id = 1  # Default
+                term_id = 1
                 if not details_df.empty and 'payment_term_id' in details_df.columns:
-                    # Find matching row in details
                     detail_match = details_df[details_df.get('payment_term_name', '') == term_name]
                     if not detail_match.empty:
                         term_id = int(detail_match.iloc[0]['payment_term_id'])
@@ -925,20 +909,17 @@ def show_invoice_preview():
                     'description': f'{term_name} ({days} days)'
                 }
     else:
-        # No payment terms found - use a default
         st.warning("⚠️ No payment terms found in selected ANs. Using default.")
         term_options = {
             'Net 30': {'id': 1, 'days': 30, 'description': 'Payment due in 30 days'}
         }
     
-    # Payment Terms Selection OUTSIDE FORM (for reactivity)
     st.markdown("---")
     col1, col2 = st.columns(2)
     
     with col1:
         term_names = list(term_options.keys())
         
-        # Set default index based on session state
         default_index = 0
         if st.session_state.selected_payment_term in term_names:
             default_index = term_names.index(st.session_state.selected_payment_term)
@@ -951,7 +932,6 @@ def show_invoice_preview():
             help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)"
         )
         
-        # Update session state if changed
         if selected_term != st.session_state.selected_payment_term:
             st.session_state.selected_payment_term = selected_term
         
@@ -959,7 +939,6 @@ def show_invoice_preview():
             st.caption(term_options[selected_term]['description'])
     
     with col2:
-        # Invoice Date (also outside form for reactivity)
         new_invoice_date = st.date_input(
             "Invoice Date",
             value=st.session_state.invoice_date,
@@ -969,23 +948,18 @@ def show_invoice_preview():
         if new_invoice_date != st.session_state.invoice_date:
             st.session_state.invoice_date = new_invoice_date
     
-    # Calculate due date based on current selections
     term_days = term_options[st.session_state.selected_payment_term]['days']
     calculated_due_date = service.calculate_due_date(st.session_state.invoice_date, term_days)
     
-    # Invoice form with remaining fields
     with st.form("invoice_form"):
         col1, col2 = st.columns(2)
         
         with col1:
             st.text_input("Invoice Number", value=invoice_number, disabled=True, key="invoice_number")
-            
-            # Display the selected values from outside the form
             st.text_input("Invoice Date", value=str(st.session_state.invoice_date), disabled=True)
             st.text_input("Payment Terms", value=st.session_state.selected_payment_term, disabled=True)
         
         with col2:
-            # Commercial Invoice input - disabled if advance payment
             commercial_inv = st.text_input(
                 "Commercial Invoice No.",
                 key="commercial_invoice_no",
@@ -998,7 +972,6 @@ def show_invoice_preview():
             else:
                 st.caption("⚠️ Required field for commercial invoices")
             
-            # Display calculated due date
             st.date_input(
                 "Due Date",
                 value=calculated_due_date,
@@ -1013,35 +986,31 @@ def show_invoice_preview():
                 key="email_to_accountant"
             )
         
-        # Summary table with VAT
         st.markdown("### 📊 Invoice Summary")
         
-        # Calculate amounts in selected currency
         if po_currency_code != invoice_currency_code:
-            # Need conversion
             converted_amounts = get_invoice_amounts_in_currency(
                 selected_df,
                 po_currency_code,
                 invoice_currency_code
             )
             
-            # Update selected_df display with converted amounts
             summary_df = service.prepare_invoice_summary(selected_df)
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
             
-            # Show conversion info
-            st.info(f"💱 Amounts converted from {po_currency_code} to {invoice_currency_code} at rate: {format_exchange_rate(converted_amounts['exchange_rate'])}")
-            
-            totals = converted_amounts
+            if converted_amounts:
+                st.info(f"💱 Amounts converted from {po_currency_code} to {invoice_currency_code} at rate: {format_exchange_rate(converted_amounts['exchange_rate'])}")
+                totals = converted_amounts
+            else:
+                st.error("❌ Cannot calculate converted amounts")
+                totals = service.calculate_invoice_totals_with_vat(selected_df)
         else:
-            # No conversion needed
             summary_df = service.prepare_invoice_summary(selected_df)
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
             
             totals = service.calculate_invoice_totals_with_vat(selected_df)
             totals['currency'] = invoice_currency_code
         
-        # Totals display
         col1, col2, col3 = st.columns([2, 1, 1])
         with col3:
             st.markdown("**Invoice Totals**")
@@ -1051,10 +1020,8 @@ def show_invoice_preview():
             st.text(f"VAT: {totals['total_vat']:,.2f} {totals['currency']}")
             st.text(f"Total: {totals['total_with_vat']:,.2f} {totals['currency']}")
         
-        # Store totals for next step
         st.session_state.invoice_totals = totals
         
-        # Form actions
         st.markdown("---")
         col1, col2, col3 = st.columns(3)
         
@@ -1068,29 +1035,25 @@ def show_invoice_preview():
                 use_container_width=True
             )
     
-    # Handle form submission
     if back_btn:
         st.session_state.wizard_step = 'select'
         st.rerun()
     
     if proceed_btn:
-        # Validate Commercial Invoice number if not advance payment
         if not st.session_state.is_advance_payment and not st.session_state.commercial_invoice_no:
             st.error("❌ Commercial Invoice Number is required for Commercial Invoices")
             return
         
-        # Get USD exchange rate
         if invoice_currency_code == 'USD':
             usd_rate = 1.0
         else:
-            usd_rate = rates.get('usd_exchange_rate', 1.0)
+            usd_rate = rates.get('usd_exchange_rate', None)
         
-        # Prepare invoice data with proper exchange rates
         st.session_state.invoice_data = {
             'invoice_number': invoice_number,
             'commercial_invoice_no': st.session_state.commercial_invoice_no if not st.session_state.is_advance_payment else '',
             'invoiced_date': st.session_state.invoice_date,
-            'due_date': calculated_due_date,  # Use the calculated due date
+            'due_date': calculated_due_date,
             'total_invoiced_amount': totals['total_with_vat'],
             'currency_id': st.session_state.invoice_currency_id,
             'usd_exchange_rate': usd_rate,
@@ -1108,11 +1071,18 @@ def show_invoice_preview():
         st.session_state.wizard_step = 'confirm'
         st.rerun()
 
-
 def show_invoice_confirm():
-    """Step 3: Confirm and Submit"""
+    """Step 3: Confirm and Submit with Duplicate Prevention"""
     
-    # Check if we have invoice data
+    # Check if already created
+    if 'invoice_just_created' in st.session_state and st.session_state.invoice_just_created:
+        st.info("✅ Invoice has been created. Redirecting...")
+        time.sleep(1)
+        st.session_state.wizard_step = 'select'
+        st.session_state.invoice_just_created = False
+        st.rerun()
+        return
+    
     if not st.session_state.get('invoice_data') or not st.session_state.get('details_df') is not None:
         st.error("No invoice data found. Please go back and complete the preview.")
         if st.button("⬅️ Back to Preview"):
@@ -1125,13 +1095,11 @@ def show_invoice_confirm():
     
     st.markdown("### ✅ Confirm and Submit")
     
-    # Display final summary
     payment_terms_dict = service.get_payment_terms_dict()
     payment_term_name = payment_terms_dict.get(
         invoice_data['payment_term_id'], {}
     ).get('name', 'N/A')
     
-    # Invoice details card
     with st.container():
         col1, col2 = st.columns(2)
         
@@ -1156,14 +1124,17 @@ def show_invoice_confirm():
             st.text(f"Lines: {len(details_df)}")
             st.text(f"Email to Accountant: {'Yes' if invoice_data['email_to_accountant'] else 'No'}")
     
-    # Exchange rate information
-    if invoice_data['invoice_currency_code'] != 'USD':
-        st.info(f"💱 USD Exchange Rate: 1 USD = {format_exchange_rate(invoice_data['usd_exchange_rate'])} {invoice_data['invoice_currency_code']}")
+    # Exchange rate information - Always show USD rate for audit purposes
+    if invoice_data.get('usd_exchange_rate') is not None:
+        if invoice_data['invoice_currency_code'] != 'USD':
+            st.info(f"💱 USD Exchange Rate: 1 USD = {format_exchange_rate(invoice_data['usd_exchange_rate'])} {invoice_data['invoice_currency_code']}")
+        else:
+            st.info("💵 Invoice currency is USD (Rate: 1.0)")
+    else:
+        st.warning("⚠️ USD exchange rate not available for this invoice")
     
-    # Line items
     st.markdown("### 📋 Line Items")
     
-    # Add VAT information to display
     selected_df = st.session_state.selected_df
     df_display = pd.merge(
         details_df[['arrival_detail_id', 'arrival_note_number', 'po_number', 'product_name', 'uninvoiced_quantity', 'buying_unit_cost']],
@@ -1173,26 +1144,26 @@ def show_invoice_confirm():
         how='left'
     )
     
-    # Format for display with currency conversion
-    df_display = df_display[['arrival_note_number', 'po_number', 'product_name', 
+    # Add ID column
+    df_display.insert(0, 'id', range(1, len(df_display) + 1))
+    
+    df_display = df_display[['id', 'arrival_note_number', 'po_number', 'product_name', 
                             'uninvoiced_quantity', 'buying_unit_cost', 'vat_percent']].copy()
     
-    # Convert unit costs if needed
     if invoice_data['po_currency_code'] != invoice_data['invoice_currency_code']:
         df_display['converted_unit_cost'] = df_display['buying_unit_cost'].apply(
             lambda x: f"{float(x.split()[0]) * invoice_data['po_to_invoice_rate']:,.2f} {invoice_data['invoice_currency_code']}"
         )
         df_display['vat_percent'] = df_display['vat_percent'].apply(lambda x: f"{x:.0f}%")
-        df_display.columns = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'VAT', 'Invoice Cost']
-        display_cols = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'Invoice Cost', 'VAT']
+        df_display.columns = ['ID', 'AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'VAT', 'Invoice Cost']
+        display_cols = ['ID', 'AN Number', 'PO Number', 'Product', 'Quantity', 'Original Cost', 'Invoice Cost', 'VAT']
     else:
         df_display['vat_percent'] = df_display['vat_percent'].apply(lambda x: f"{x:.0f}%")
-        df_display.columns = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
-        display_cols = ['AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
+        df_display.columns = ['ID', 'AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
+        display_cols = ['ID', 'AN Number', 'PO Number', 'Product', 'Quantity', 'Unit Cost', 'VAT']
     
     st.dataframe(df_display[display_cols], use_container_width=True, hide_index=True)
     
-    # Show total breakdown
     if hasattr(st.session_state, 'invoice_totals'):
         totals = st.session_state.invoice_totals
         col1, col2, col3 = st.columns(3)
@@ -1202,10 +1173,8 @@ def show_invoice_confirm():
             st.text(f"VAT: {totals['total_vat']:,.2f} {totals['currency']}")
             st.text(f"Total: {totals['total_with_vat']:,.2f} {totals['currency']}")
     
-    # Warning
     st.warning("⚠️ Please review the information above carefully. This action cannot be undone.")
     
-    # Actions
     col1, col2, col3 = st.columns(3)
     
     with col1:
@@ -1215,7 +1184,13 @@ def show_invoice_confirm():
     
     with col3:
         if st.button("💾 Create Invoice", type="primary", use_container_width=True):
-            # Create invoice with proper exchange rates
+            # Prevent duplicate submissions
+            if st.session_state.invoice_creating:
+                st.warning("⏳ Invoice is being created. Please wait...")
+                return
+            
+            st.session_state.invoice_creating = True
+            
             with st.spinner("Creating invoice..."):
                 success, message, invoice_id = create_purchase_invoice(
                     invoice_data,
@@ -1224,47 +1199,40 @@ def show_invoice_confirm():
                 )
                 
                 if success:
-                    # Success dialog
+                    # Show success briefly
                     st.success(f"✅ {message}")
                     st.balloons()
                     
-                    # Show success details
-                    with st.container():
-                        invoice_type = "Advance Payment (PI)" if invoice_data.get('invoice_type') == 'PROFORMA_INVOICE' else "Commercial Invoice (CI)"
-                        st.info(f"""
-                        **Invoice Created Successfully!**
-                        - Invoice Type: {invoice_type}
-                        - Invoice ID: {invoice_id}
-                        - Invoice Number: {invoice_data['invoice_number']}
-                        - Currency: {invoice_data['invoice_currency_code']}
-                        - Payment Terms: {payment_term_name}
-                        - Total Amount: {invoice_data['total_invoiced_amount']:,.2f} {invoice_data['invoice_currency_code']}
-                        """)
-                        
-                        # Options
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("📝 Create Another Invoice", use_container_width=True):
-                                # Reset all session state
-                                st.session_state.selected_ans = []
-                                st.session_state.wizard_step = 'select'
-                                st.session_state.select_all = False
-                                st.session_state.invoice_data = None
-                                st.session_state.details_df = None
-                                st.session_state.selected_df = None
-                                st.session_state.current_page = 1  # Reset to first page
-                                st.session_state.is_advance_payment = False  # Reset advance payment state
-                                st.session_state.invoice_currency_code = None
-                                st.session_state.invoice_currency_id = None
-                                st.session_state.exchange_rates = None
-                                st.session_state.invoice_totals = None
-                                st.rerun()
-                        
-                        with col2:
-                            if st.button("📊 View Invoice History", use_container_width=True):
-                                st.switch_page("pages/2_📊_Invoice_History.py")
+                    # Store success info for display on home page
+                    st.session_state.last_created_invoice = {
+                        'id': invoice_id,
+                        'number': invoice_data['invoice_number'],
+                        'amount': invoice_data['total_invoiced_amount'],
+                        'currency': invoice_data['invoice_currency_code']
+                    }
+                    
+                    # Clear all selection data to prevent duplicates
+                    for key in list(st.session_state.keys()):
+                        if key not in ['username', 'authenticated', 'role', 'last_created_invoice']:
+                            del st.session_state[key]
+                    
+                    # Reset to initial state
+                    st.session_state.wizard_step = 'select'
+                    st.session_state.selected_ans = []
+                    st.session_state.current_page = 1
+                    st.session_state.invoice_creating = False
+                    st.session_state.invoice_just_created = True
+                    
+                    # Show redirect message
+                    with st.empty():
+                        for i in range(3, 0, -1):
+                            st.info(f"🔄 Redirecting to home page in {i} seconds...")
+                            time.sleep(1)
+                    
+                    st.rerun()
                 else:
                     st.error(f"❌ {message}")
+                    st.session_state.invoice_creating = False
 
 if __name__ == "__main__":
     main()

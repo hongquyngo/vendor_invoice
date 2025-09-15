@@ -86,13 +86,16 @@ class InvoiceService:
 
     @staticmethod
     def prepare_invoice_summary(df: pd.DataFrame) -> pd.DataFrame:
-        """Prepare summary for invoice preview (used at lines 844, 847)"""
+        """Prepare summary for invoice preview with ID column (used at lines 844, 847)"""
         # Group by PO, product, and VAT rate
         summary = df.groupby(['po_number', 'pt_code', 'product_name', 'buying_unit_cost', 'vat_percent']).agg({
             'uninvoiced_quantity': 'sum',
             'true_remaining_qty': 'sum' if 'true_remaining_qty' in df.columns else lambda x: None,
             'arrival_note_number': lambda x: ', '.join(x.unique())
         }).reset_index()
+        
+        # Add row ID column (starting from 1)
+        summary.insert(0, 'id', range(1, len(summary) + 1))
         
         # Use true_remaining_qty if available
         if 'true_remaining_qty' in summary.columns and summary['true_remaining_qty'].notna().any():
@@ -124,8 +127,12 @@ class InvoiceService:
         summary['vat_amount'] = summary['vat_amount'].apply(lambda x: f"{x:,.2f}")
         summary['total_amount'] = summary['total_amount'].apply(lambda x: f"{x:,.2f}")
         
+        # Format quantity with 2 decimal places
+        summary[qty_col] = summary[qty_col].apply(lambda x: f"{x:,.2f}")
+        
         # Rename columns
         columns_rename = {
+            'id': 'ID',
             'po_number': 'PO Number',
             'pt_code': 'PT Code',
             'product_name': 'Product',
@@ -143,8 +150,8 @@ class InvoiceService:
         
         summary.rename(columns=columns_rename, inplace=True)
         
-        # Reorder columns
-        display_cols = ['PO Number', 'PT Code', 'Product', 'Unit Cost', 
+        # Reorder columns with ID first
+        display_cols = ['ID', 'PO Number', 'PT Code', 'Product', 'Unit Cost', 
                        'Quantity', 'AN Numbers', 'Subtotal', 'VAT', 
                        'VAT Amount', 'Total']
         
@@ -203,38 +210,43 @@ class InvoiceService:
         # PO Level Validation
         if 'product_purchase_order_id' in df.columns:
             po_line_ids = df['product_purchase_order_id'].unique().tolist()
-            po_summary = get_po_line_summary(po_line_ids)
-            
-            if not po_summary.empty:
-                for po_id in po_line_ids:
-                    po_data = po_summary[po_summary['product_purchase_order_id'] == po_id]
-                    if po_data.empty:
-                        continue
-                    
-                    po_row = po_data.iloc[0]
-                    selected_for_po = df[df['product_purchase_order_id'] == po_id]
-                    total_selected = selected_for_po['uninvoiced_quantity'].sum()
-                    
-                    # Check if selection would exceed PO quantity
-                    remaining_qty = po_row.get('po_remaining_qty', float('inf'))
-                    if total_selected > remaining_qty * 1.1:  # Allow 10% tolerance
-                        validation_results['can_invoice'] = False
-                        messages['error'] = f"Selection exceeds PO remaining quantity for {po_row['po_number']}-{po_row['pt_code']}"
-                        return validation_results, messages
-                    
-                    # Warnings for legacy invoices
-                    if po_row.get('legacy_invoice_qty', 0) > 0:
-                        validation_results['has_warnings'] = True
-                        messages['warnings'].append(
-                            f"PO {po_row['po_number']}-{po_row['pt_code']} has {po_row['legacy_invoice_qty']:.0f} units from legacy invoices"
-                        )
-                    
-                    # Warning if close to limit
-                    if total_selected > remaining_qty * 0.9:
-                        validation_results['has_warnings'] = True
-                        messages['warnings'].append(
-                            f"PO {po_row['po_number']}-{po_row['pt_code']} will be >90% invoiced"
-                        )
+            try:
+                po_summary = get_po_line_summary(po_line_ids)
+                
+                if not po_summary.empty:
+                    for po_id in po_line_ids:
+                        po_data = po_summary[po_summary['product_purchase_order_id'] == po_id]
+                        if po_data.empty:
+                            continue
+                        
+                        po_row = po_data.iloc[0]
+                        selected_for_po = df[df['product_purchase_order_id'] == po_id]
+                        total_selected = selected_for_po['uninvoiced_quantity'].sum()
+                        
+                        # Check if selection would exceed PO quantity
+                        remaining_qty = po_row.get('po_remaining_qty', float('inf'))
+                        if total_selected > remaining_qty * 1.1:  # Allow 10% tolerance
+                            validation_results['can_invoice'] = False
+                            messages['error'] = f"Selection exceeds PO remaining quantity for {po_row['po_number']}-{po_row['pt_code']}"
+                            return validation_results, messages
+                        
+                        # Warnings for legacy invoices
+                        if po_row.get('legacy_invoice_qty', 0) > 0:
+                            validation_results['has_warnings'] = True
+                            messages['warnings'].append(
+                                f"PO {po_row['po_number']}-{po_row['pt_code']} has {po_row['legacy_invoice_qty']:.0f} units from legacy invoices"
+                            )
+                        
+                        # Warning if close to limit
+                        if total_selected > remaining_qty * 0.9:
+                            validation_results['has_warnings'] = True
+                            messages['warnings'].append(
+                                f"PO {po_row['po_number']}-{po_row['pt_code']} will be >90% invoiced"
+                            )
+            except Exception as e:
+                logger.error(f"Error validating PO levels: {e}")
+                validation_results['has_warnings'] = True
+                messages['warnings'].append("Could not validate PO level constraints")
         
         # Check payment terms
         payment_terms = df['payment_term'].dropna().unique()
@@ -251,6 +263,31 @@ class InvoiceService:
                 validation_results['has_warnings'] = True
                 messages['warnings'].append(
                     f"Multiple VAT rates: {', '.join([f'{v:.0f}%' for v in vat_rates])}"
+                )
+        
+        # Check for problematic flags
+        if 'po_line_is_over_delivered' in df.columns:
+            over_delivered = df[df['po_line_is_over_delivered'] == 'Y']
+            if not over_delivered.empty:
+                validation_results['has_warnings'] = True
+                messages['warnings'].append(
+                    f"{len(over_delivered)} PO line(s) have over-delivery"
+                )
+        
+        if 'po_line_is_over_invoiced' in df.columns:
+            over_invoiced = df[df['po_line_is_over_invoiced'] == 'Y']
+            if not over_invoiced.empty:
+                validation_results['has_warnings'] = True
+                messages['warnings'].append(
+                    f"{len(over_invoiced)} PO line(s) have over-invoicing"
+                )
+        
+        if 'has_legacy_invoices' in df.columns:
+            has_legacy = df[df['has_legacy_invoices'] == 'Y']
+            if not has_legacy.empty:
+                validation_results['has_warnings'] = True
+                messages['warnings'].append(
+                    f"{len(has_legacy)} PO line(s) have legacy invoices"
                 )
         
         return validation_results, messages

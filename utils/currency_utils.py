@@ -4,7 +4,7 @@ import requests
 import logging
 import streamlit as st
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timedelta
 from .db import get_db_engine
 from sqlalchemy import text
@@ -62,6 +62,7 @@ def get_latest_exchange_rate(from_currency: str, to_currency: str) -> Optional[f
                 _rate_cache[cache_key] = rate
                 _cache_expiry[cache_key] = now + timedelta(hours=1)
                 
+                logger.info(f"Successfully fetched rate {from_currency}/{to_currency}: {rate}")
                 return rate
         else:
             logger.error(f"API error: {data.get('error', {}).get('info', 'Unknown error')}")
@@ -95,7 +96,9 @@ def get_rate_from_database(from_currency: str, to_currency: str) -> Optional[flo
             }).fetchone()
             
             if result and result[0] is not None:
-                return float(result[0])
+                rate = float(result[0])
+                logger.info(f"Database rate {from_currency}/{to_currency}: {rate}")
+                return rate
             
             # Try inverse rate
             inverse_query = text("""
@@ -114,12 +117,14 @@ def get_rate_from_database(from_currency: str, to_currency: str) -> Optional[flo
             }).fetchone()
             
             if result and result[0] is not None and result[0] > 0:
-                return 1.0 / float(result[0])
+                rate = 1.0 / float(result[0])
+                logger.info(f"Database inverse rate {from_currency}/{to_currency}: {rate}")
+                return rate
                 
     except Exception as e:
         logger.error(f"Error getting rate from database: {e}")
     
-    # Return None if no rate found
+    logger.warning(f"No rate found for {from_currency}/{to_currency}")
     return None
 
 @st.cache_data(ttl=3600)
@@ -160,26 +165,67 @@ def get_available_currencies() -> pd.DataFrame:
 def calculate_exchange_rates(po_currency_code: str, invoice_currency_code: str) -> Dict[str, Optional[float]]:
     """
     Calculate all necessary exchange rates for invoice
+    Always fetches USD rate for reporting purposes
     
     Returns dict with:
-    - usd_exchange_rate: USD to invoice currency rate (or None)
-    - po_to_invoice_rate: PO currency to invoice currency rate (or None)
+    - usd_exchange_rate: USD to invoice currency rate (always calculated)
+    - po_to_invoice_rate: PO currency to invoice currency rate
     """
     rates = {}
     
-    # USD to invoice currency
+    # ALWAYS get USD to invoice currency rate (important for financial reporting)
     if invoice_currency_code == 'USD':
         rates['usd_exchange_rate'] = 1.0
+        logger.info("Invoice currency is USD, rate = 1.0")
     else:
+        # Always fetch USD rate, even if not needed for conversion
         rates['usd_exchange_rate'] = get_latest_exchange_rate('USD', invoice_currency_code)
+        
+        # Log warning if USD rate couldn't be fetched
+        if rates['usd_exchange_rate'] is None:
+            logger.warning(f"Could not fetch USD to {invoice_currency_code} exchange rate")
+        else:
+            logger.info(f"USD to {invoice_currency_code} rate: {rates['usd_exchange_rate']}")
     
-    # PO to invoice currency
+    # PO to invoice currency rate
     if po_currency_code == invoice_currency_code:
         rates['po_to_invoice_rate'] = 1.0
+        logger.info(f"Same currency {po_currency_code}, conversion rate = 1.0")
     else:
         rates['po_to_invoice_rate'] = get_latest_exchange_rate(po_currency_code, invoice_currency_code)
+        
+        # Log warning if conversion rate couldn't be fetched
+        if rates['po_to_invoice_rate'] is None:
+            logger.warning(f"Could not fetch {po_currency_code} to {invoice_currency_code} exchange rate")
+        else:
+            logger.info(f"{po_currency_code} to {invoice_currency_code} rate: {rates['po_to_invoice_rate']}")
     
     return rates
+
+def validate_exchange_rates(rates: Dict[str, Optional[float]], 
+                          po_currency: str, 
+                          invoice_currency: str) -> Tuple[bool, List[str]]:
+    """
+    Validate that all required exchange rates are available
+    
+    Returns:
+        (is_valid, list_of_warnings)
+    """
+    warnings = []
+    is_valid = True
+    
+    # Check PO to invoice rate if currencies are different
+    if po_currency != invoice_currency:
+        if rates.get('po_to_invoice_rate') is None:
+            warnings.append(f"Cannot convert {po_currency} to {invoice_currency}")
+            is_valid = False
+    
+    # USD rate is important but not critical for invoice creation
+    if invoice_currency != 'USD' and rates.get('usd_exchange_rate') is None:
+        warnings.append(f"USD to {invoice_currency} rate not available (needed for reporting)")
+        # Don't set is_valid to False - this is just a warning
+    
+    return is_valid, warnings
 
 def format_exchange_rate(rate: Optional[float]) -> str:
     """Format exchange rate for display"""
@@ -225,6 +271,7 @@ def get_invoice_amounts_in_currency(
         
         # Return None if exchange rate is not available
         if exchange_rate is None:
+            logger.error(f"Cannot calculate amounts: No exchange rate for {po_currency}/{invoice_currency}")
             return None
     
     total_amount = 0
