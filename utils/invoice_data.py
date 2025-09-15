@@ -529,8 +529,23 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 # Get exchange rate
                 po_to_invoice_rate = invoice_data.get('po_to_invoice_rate', 1.0)
                 
-                # Calculate amount
-                amount = unit_cost * row['uninvoiced_quantity'] * po_to_invoice_rate
+                # Get VAT percentage from product_purchase_orders table
+                vat_percent = 0
+                if 'product_purchase_order_id' in row and row['product_purchase_order_id']:
+                    vat_query = text("""
+                    SELECT vat_gst 
+                    FROM product_purchase_orders 
+                    WHERE id = :ppo_id 
+                    AND delete_flag = 0
+                    """)
+                    vat_result = conn.execute(vat_query, {'ppo_id': row['product_purchase_order_id']}).fetchone()
+                    if vat_result and vat_result[0] is not None:
+                        vat_percent = float(vat_result[0])
+                
+                # Calculate amount INCLUDING VAT (to match existing data pattern)
+                base_amount = unit_cost * row['uninvoiced_quantity'] * po_to_invoice_rate
+                vat_multiplier = 1 + (vat_percent / 100)
+                amount = base_amount * vat_multiplier
                 
                 # Prepare detail parameters
                 detail_params = {

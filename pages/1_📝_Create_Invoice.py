@@ -619,6 +619,23 @@ def show_invoice_preview():
     # Invoice header section
     st.markdown("### 📄 Invoice Information")
     
+    # Initialize session state for payment term if not exists
+    if 'selected_payment_term' not in st.session_state:
+        # Get initial payment term
+        unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
+        if unique_payment_terms_from_selected:
+            most_common_term = selected_df['payment_term'].mode()
+            if not most_common_term.empty:
+                st.session_state.selected_payment_term = most_common_term.iloc[0]
+            else:
+                st.session_state.selected_payment_term = unique_payment_terms_from_selected[0]
+        else:
+            st.session_state.selected_payment_term = 'Net 30'
+    
+    # Initialize invoice date in session state if not exists
+    if 'invoice_date' not in st.session_state:
+        st.session_state.invoice_date = date.today()
+    
     # Advance Payment checkbox - OUTSIDE THE FORM for immediate refresh
     col1, col2 = st.columns(2)
     
@@ -707,89 +724,103 @@ def show_invoice_preview():
     st.session_state.invoice_currency_id = invoice_currency_id
     st.session_state.exchange_rates = rates
     
-    # Invoice form
+    # Build payment term options BEFORE the form
+    unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
+    
+    # Build payment term options
+    term_options = {}
+    
+    if unique_payment_terms_from_selected:
+        # Get all payment terms data for reference
+        all_payment_terms_df = get_payment_terms()
+        
+        # Build options from selected AN payment terms
+        for term_name in unique_payment_terms_from_selected:
+            # Look up in database
+            db_match = all_payment_terms_df[all_payment_terms_df['name'] == term_name]
+            
+            if not db_match.empty:
+                row = db_match.iloc[0]
+                term_options[term_name] = {
+                    'id': int(row['id']),
+                    'days': int(row['days']),
+                    'description': row.get('description', '')
+                }
+            else:
+                # Not in database - calculate days and use a default ID
+                days = calculate_days_from_term_name(term_name)
+                # Try to find ID from details_df if available
+                term_id = 1  # Default
+                if not details_df.empty and 'payment_term_id' in details_df.columns:
+                    # Find matching row in details
+                    detail_match = details_df[details_df.get('payment_term_name', '') == term_name]
+                    if not detail_match.empty:
+                        term_id = int(detail_match.iloc[0]['payment_term_id'])
+                
+                term_options[term_name] = {
+                    'id': term_id,
+                    'days': days,
+                    'description': f'{term_name} ({days} days)'
+                }
+    else:
+        # No payment terms found - use a default
+        st.warning("⚠️ No payment terms found in selected ANs. Using default.")
+        term_options = {
+            'Net 30': {'id': 1, 'days': 30, 'description': 'Payment due in 30 days'}
+        }
+    
+    # Payment Terms Selection OUTSIDE FORM (for reactivity)
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        term_names = list(term_options.keys())
+        
+        # Set default index based on session state
+        default_index = 0
+        if st.session_state.selected_payment_term in term_names:
+            default_index = term_names.index(st.session_state.selected_payment_term)
+        
+        selected_term = st.selectbox(
+            "Payment Terms",
+            options=term_names,
+            index=default_index,
+            key="payment_terms_selector",
+            help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)"
+        )
+        
+        # Update session state if changed
+        if selected_term != st.session_state.selected_payment_term:
+            st.session_state.selected_payment_term = selected_term
+        
+        if term_options[selected_term].get('description'):
+            st.caption(term_options[selected_term]['description'])
+    
+    with col2:
+        # Invoice Date (also outside form for reactivity)
+        new_invoice_date = st.date_input(
+            "Invoice Date",
+            value=st.session_state.invoice_date,
+            key="invoice_date_selector"
+        )
+        
+        if new_invoice_date != st.session_state.invoice_date:
+            st.session_state.invoice_date = new_invoice_date
+    
+    # Calculate due date based on current selections
+    term_days = term_options[st.session_state.selected_payment_term]['days']
+    calculated_due_date = service.calculate_due_date(st.session_state.invoice_date, term_days)
+    
+    # Invoice form with remaining fields
     with st.form("invoice_form"):
         col1, col2 = st.columns(2)
         
         with col1:
             st.text_input("Invoice Number", value=invoice_number, disabled=True, key="invoice_number")
             
-            invoice_date = st.date_input(
-                "Invoice Date",
-                value=date.today(),
-                key="invoice_date"
-            )
-            
-            # Payment terms
-            unique_payment_terms_from_selected = selected_df['payment_term'].dropna().unique().tolist()
-            
-            # Build payment term options
-            term_options = {}
-            default_term_name = None
-            
-            if unique_payment_terms_from_selected:
-                # Get all payment terms data for reference
-                all_payment_terms_df = get_payment_terms()
-                
-                # Get the most common payment term from selected ANs
-                most_common_term = selected_df['payment_term'].mode()
-                if not most_common_term.empty:
-                    default_term_name = most_common_term.iloc[0]
-                
-                # Build options from selected AN payment terms
-                for term_name in unique_payment_terms_from_selected:
-                    # Look up in database
-                    db_match = all_payment_terms_df[all_payment_terms_df['name'] == term_name]
-                    
-                    if not db_match.empty:
-                        row = db_match.iloc[0]
-                        term_options[term_name] = {
-                            'id': int(row['id']),
-                            'days': int(row['days']),
-                            'description': row.get('description', '')
-                        }
-                    else:
-                        # Not in database - calculate days and use a default ID
-                        days = calculate_days_from_term_name(term_name)
-                        # Try to find ID from details_df if available
-                        term_id = 1  # Default
-                        if not details_df.empty and 'payment_term_id' in details_df.columns:
-                            # Find matching row in details
-                            detail_match = details_df[details_df.get('payment_term_name', '') == term_name]
-                            if not detail_match.empty:
-                                term_id = int(detail_match.iloc[0]['payment_term_id'])
-                        
-                        term_options[term_name] = {
-                            'id': term_id,
-                            'days': days,
-                            'description': f'{term_name} ({days} days)'
-                        }
-            else:
-                # No payment terms found - use a default
-                st.warning("⚠️ No payment terms found in selected ANs. Using default.")
-                term_options = {
-                    'Net 30': {'id': 1, 'days': 30, 'description': 'Payment due in 30 days'}
-                }
-                default_term_name = 'Net 30'
-            
-            # Get list of term names for dropdown
-            term_names = list(term_options.keys())
-            
-            # Set default index
-            default_index = 0
-            if default_term_name and default_term_name in term_names:
-                default_index = term_names.index(default_term_name)
-            
-            selected_term = st.selectbox(
-                "Payment Terms",
-                options=term_names,
-                index=default_index,
-                key="payment_terms",
-                help=f"Payment terms from selected ANs ({len(term_names)} option(s) available)"
-            )
-            
-            if term_options[selected_term].get('description'):
-                st.caption(term_options[selected_term]['description'])
+            # Display the selected values from outside the form
+            st.text_input("Invoice Date", value=str(st.session_state.invoice_date), disabled=True)
+            st.text_input("Payment Terms", value=st.session_state.selected_payment_term, disabled=True)
         
         with col2:
             # Commercial Invoice input - disabled if advance payment
@@ -805,15 +836,13 @@ def show_invoice_preview():
             else:
                 st.caption("⚠️ Required field for commercial invoices")
             
-            # Calculate due date
-            term_days = term_options[selected_term]['days']
-            due_date = service.calculate_due_date(invoice_date, term_days)
-            
+            # Display calculated due date
             st.date_input(
                 "Due Date",
-                value=due_date,
+                value=calculated_due_date,
                 key="due_date",
-                help=f"Calculated based on {selected_term} ({term_days} days)"
+                disabled=True,
+                help=f"Auto-calculated: Invoice Date + {term_days} days ({st.session_state.selected_payment_term})"
             )
             
             email_accountant = st.checkbox(
@@ -899,13 +928,13 @@ def show_invoice_preview():
             'invoice_number': invoice_number,
             'commercial_invoice_no': st.session_state.commercial_invoice_no if not st.session_state.is_advance_payment else '',
             'invoiced_date': st.session_state.invoice_date,
-            'due_date': st.session_state.due_date,
+            'due_date': calculated_due_date,  # Use the calculated due date
             'total_invoiced_amount': totals['total_with_vat'],
             'currency_id': st.session_state.invoice_currency_id,
             'usd_exchange_rate': usd_rate,
             'seller_id': details_df['vendor_id'].iloc[0] if not details_df.empty else None,
             'buyer_id': details_df['entity_id'].iloc[0] if not details_df.empty else None,
-            'payment_term_id': term_options[st.session_state.payment_terms]['id'],
+            'payment_term_id': term_options[st.session_state.selected_payment_term]['id'],
             'email_to_accountant': 1 if st.session_state.email_to_accountant else 0,
             'created_by': st.session_state.username,
             'invoice_type': 'PROFORMA_INVOICE' if st.session_state.is_advance_payment else 'COMMERCIAL_INVOICE',
@@ -916,6 +945,7 @@ def show_invoice_preview():
         }
         st.session_state.wizard_step = 'confirm'
         st.rerun()
+
 
 def show_invoice_confirm():
     """Step 3: Confirm and Submit"""
