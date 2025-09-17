@@ -351,9 +351,14 @@ def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     
     return True, ""
 
+# utils/invoice_data.py - Updated create_purchase_invoice function
+
 def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_id: str) -> Tuple[bool, str, Optional[int]]:
     """
-    Create purchase invoice with enhanced validation for PO level constraints
+    Create purchase invoice with proper VAT field handling
+    Updated to handle new fields:
+    - total_invoiced_amount_exclude_vat in purchase_invoices
+    - amount_exclude_vat and vat_gst in purchase_invoice_details
     """
     engine = get_db_engine()
     
@@ -376,12 +381,27 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
             
             keycloak_id = keycloak_result[0]
             
-            # Prepare header data
+            # Calculate total amounts excluding VAT
+            total_amount_exclude_vat = 0
+            po_to_invoice_rate = invoice_data.get('po_to_invoice_rate', 1.0)
+            
+            # First pass: calculate totals
+            for _, row in details_df.iterrows():
+                unit_cost_str = row['buying_unit_cost']
+                unit_cost = float(unit_cost_str.split()[0])
+                quantity = row['uninvoiced_quantity']
+                
+                # Calculate base amount in invoice currency (excluding VAT)
+                base_amount_in_invoice_currency = unit_cost * quantity * po_to_invoice_rate
+                total_amount_exclude_vat += base_amount_in_invoice_currency
+            
+            # Prepare header data with both including and excluding VAT amounts
             header_params = {
                 'invoice_number': invoice_data['invoice_number'],
                 'invoiced_date': invoice_data['invoiced_date'],
                 'due_date': invoice_data['due_date'],
-                'total_invoiced_amount': invoice_data['total_invoiced_amount'],
+                'total_invoiced_amount': invoice_data['total_invoiced_amount'],  # Including VAT
+                'total_invoiced_amount_exclude_vat': round(total_amount_exclude_vat, 2),  # Excluding VAT
                 'seller_id': invoice_data['seller_id'],
                 'buyer_id': invoice_data['buyer_id'],
                 'currency_id': invoice_data['currency_id'],
@@ -424,16 +444,13 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
             result = conn.execute(header_query, header_params)
             invoice_id = result.lastrowid
             
-            # Insert purchase_invoice_details
+            # Insert purchase_invoice_details with VAT fields
             for _, row in details_df.iterrows():
                 # Extract unit cost
                 unit_cost_str = row['buying_unit_cost']
                 unit_cost = float(unit_cost_str.split()[0])
                 
-                # Get exchange rate
-                po_to_invoice_rate = invoice_data.get('po_to_invoice_rate', 1.0)
-                
-                # Get VAT percentage
+                # Get VAT percentage from product_purchase_orders
                 vat_percent = 0
                 if 'product_purchase_order_id' in row and row['product_purchase_order_id']:
                     vat_query = text("""
@@ -446,19 +463,26 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                     if vat_result and vat_result[0] is not None:
                         vat_percent = float(vat_result[0])
                 
-                # Calculate amount INCLUDING VAT
-                base_amount = unit_cost * row['uninvoiced_quantity'] * po_to_invoice_rate
+                # Calculate amounts
+                quantity = row['uninvoiced_quantity']
+                
+                # Amount excluding VAT in invoice currency
+                amount_exclude_vat = round(unit_cost * quantity * po_to_invoice_rate, 2)
+                
+                # Amount including VAT
                 vat_multiplier = 1 + (vat_percent / 100)
-                amount = base_amount * vat_multiplier
+                amount_include_vat = round(amount_exclude_vat * vat_multiplier, 2)
                 
                 detail_params = {
                     'purchase_invoice_id': invoice_id,
                     'purchase_order_id': row['purchase_order_id'],
                     'product_purchase_order_id': row['product_purchase_order_id'],
                     'arrival_detail_id': row['arrival_detail_id'],
-                    'purchased_invoice_quantity': row['uninvoiced_quantity'],
-                    'invoiced_quantity': row['uninvoiced_quantity'],
-                    'amount': amount,
+                    'purchased_invoice_quantity': quantity,
+                    'invoiced_quantity': quantity,
+                    'amount': amount_include_vat,  # Amount INCLUDING VAT
+                    'amount_exclude_vat': amount_exclude_vat,  # Amount EXCLUDING VAT
+                    'vat_gst': vat_percent,  # VAT percentage
                     'exchange_rate': po_to_invoice_rate
                 }
                 
@@ -471,6 +495,8 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                     purchased_invoice_quantity,
                     invoiced_quantity,
                     amount,
+                    amount_exclude_vat,
+                    vat_gst,
                     exchange_rate,
                     delete_flag
                 ) VALUES (
@@ -481,6 +507,8 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                     :purchased_invoice_quantity,
                     :invoiced_quantity,
                     :amount,
+                    :amount_exclude_vat,
+                    :vat_gst,
                     :exchange_rate,
                     0
                 )
@@ -488,11 +516,20 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 
                 conn.execute(detail_query, detail_params)
             
+            # Log the successful creation with VAT details
+            logger.info(f"""
+            Invoice {invoice_data['invoice_number']} created successfully:
+            - Total with VAT: {invoice_data['total_invoiced_amount']:,.2f} {invoice_data['invoice_currency_code']}
+            - Total without VAT: {total_amount_exclude_vat:,.2f} {invoice_data['invoice_currency_code']}
+            - VAT amount: {invoice_data['total_invoiced_amount'] - total_amount_exclude_vat:,.2f} {invoice_data['invoice_currency_code']}
+            """)
+            
             return True, f"Invoice {invoice_data['invoice_number']} created successfully", invoice_id
             
     except Exception as e:
         logger.error(f"Error creating invoice: {e}")
         return False, f"Error creating invoice: {str(e)}", None
+
 
 def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: bool = False) -> str:
     """Generate unique invoice number"""
