@@ -1,14 +1,19 @@
 # utils/invoice_data.py
+# Complete implementation with all invoice management functions
 
 import pandas as pd
 from sqlalchemy import text
 import streamlit as st
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import logging
 from typing import List, Dict, Optional, Tuple
 from .db import get_db_engine
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CORE INVOICE DATA FUNCTIONS
+# ============================================================================
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
@@ -181,35 +186,6 @@ def get_uninvoiced_ans(filters: Dict = None) -> pd.DataFrame:
             if filters.get('po_numbers'):
                 conditions.append("can.po_number IN :po_numbers")
                 params['po_numbers'] = tuple(filters['po_numbers'])
-            
-            if filters.get('po_line_statuses'):
-                conditions.append("can.po_line_status IN :po_line_statuses")
-                params['po_line_statuses'] = tuple(filters['po_line_statuses'])
-            
-            if filters.get('show_over_delivered'):
-                conditions.append("can.po_line_is_over_delivered = 'Y'")
-            
-            if filters.get('show_over_invoiced'):
-                conditions.append("can.po_line_is_over_invoiced = 'Y'")
-            
-            if filters.get('show_has_legacy'):
-                conditions.append("COALESCE(li.legacy_invoice_qty, 0) > 0")
-            
-            if filters.get('arrival_completion_min') is not None:
-                conditions.append("can.po_line_arrival_completion_percent >= :arrival_completion_min")
-                params['arrival_completion_min'] = filters['arrival_completion_min']
-            
-            if filters.get('arrival_completion_max') is not None:
-                conditions.append("can.po_line_arrival_completion_percent <= :arrival_completion_max")
-                params['arrival_completion_max'] = filters['arrival_completion_max']
-            
-            if filters.get('invoice_completion_min') is not None:
-                conditions.append("can.po_line_invoice_completion_percent >= :invoice_completion_min")
-                params['invoice_completion_min'] = filters['invoice_completion_min']
-            
-            if filters.get('invoice_completion_max') is not None:
-                conditions.append("can.po_line_invoice_completion_percent <= :invoice_completion_max")
-                params['invoice_completion_max'] = filters['invoice_completion_max']
         
         # Add conditions to query
         if conditions:
@@ -326,7 +302,7 @@ def get_invoice_details(can_line_ids: List[int]) -> pd.DataFrame:
 
 def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     """
-    Basic validation for selected ANs (used at line 569 in main page)
+    Basic validation for selected ANs
     
     Returns:
         (is_valid, error_message)
@@ -351,14 +327,9 @@ def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     
     return True, ""
 
-# utils/invoice_data.py - Updated create_purchase_invoice function
-
 def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_id: str) -> Tuple[bool, str, Optional[int]]:
     """
     Create purchase invoice with proper VAT field handling
-    Updated to handle new fields:
-    - total_invoiced_amount_exclude_vat in purchase_invoices
-    - amount_exclude_vat and vat_gst in purchase_invoice_details
     """
     engine = get_db_engine()
     
@@ -395,13 +366,13 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 base_amount_in_invoice_currency = unit_cost * quantity * po_to_invoice_rate
                 total_amount_exclude_vat += base_amount_in_invoice_currency
             
-            # Prepare header data with both including and excluding VAT amounts
+            # Prepare header data
             header_params = {
                 'invoice_number': invoice_data['invoice_number'],
                 'invoiced_date': invoice_data['invoiced_date'],
                 'due_date': invoice_data['due_date'],
-                'total_invoiced_amount': invoice_data['total_invoiced_amount'],  # Including VAT
-                'total_invoiced_amount_exclude_vat': round(total_amount_exclude_vat, 2),  # Excluding VAT
+                'total_invoiced_amount': invoice_data['total_invoiced_amount'],
+                'total_invoiced_amount_exclude_vat': round(total_amount_exclude_vat, 2),
                 'seller_id': invoice_data['seller_id'],
                 'buyer_id': invoice_data['buyer_id'],
                 'currency_id': invoice_data['currency_id'],
@@ -480,9 +451,9 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                     'arrival_detail_id': row['arrival_detail_id'],
                     'purchased_invoice_quantity': quantity,
                     'invoiced_quantity': quantity,
-                    'amount': amount_include_vat,  # Amount INCLUDING VAT
-                    'amount_exclude_vat': amount_exclude_vat,  # Amount EXCLUDING VAT
-                    'vat_gst': vat_percent,  # VAT percentage
+                    'amount': amount_include_vat,
+                    'amount_exclude_vat': amount_exclude_vat,
+                    'vat_gst': vat_percent,
                     'exchange_rate': po_to_invoice_rate
                 }
                 
@@ -516,20 +487,12 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 
                 conn.execute(detail_query, detail_params)
             
-            # Log the successful creation with VAT details
-            logger.info(f"""
-            Invoice {invoice_data['invoice_number']} created successfully:
-            - Total with VAT: {invoice_data['total_invoiced_amount']:,.2f} {invoice_data['invoice_currency_code']}
-            - Total without VAT: {total_amount_exclude_vat:,.2f} {invoice_data['invoice_currency_code']}
-            - VAT amount: {invoice_data['total_invoiced_amount'] - total_amount_exclude_vat:,.2f} {invoice_data['invoice_currency_code']}
-            """)
-            
+            logger.info(f"Invoice {invoice_data['invoice_number']} created successfully with ID {invoice_id}")
             return True, f"Invoice {invoice_data['invoice_number']} created successfully", invoice_id
             
     except Exception as e:
         logger.error(f"Error creating invoice: {e}")
         return False, f"Error creating invoice: {str(e)}", None
-
 
 def generate_invoice_number(vendor_id: int, buyer_id: int, is_advance_payment: bool = False) -> str:
     """Generate unique invoice number"""
@@ -690,3 +653,368 @@ def get_po_line_summary(po_line_ids: List[int]) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Error getting PO line summary: {e}")
         return pd.DataFrame()
+
+# ============================================================================
+# INVOICE MANAGEMENT FUNCTIONS (CRUD)
+# ============================================================================
+
+@st.cache_data(ttl=60)
+def get_recent_invoices(limit: int = 100) -> pd.DataFrame:
+    """
+    Get recent invoices using the purchase_invoice_full_view
+    """
+    try:
+        engine = get_db_engine()
+        
+        query = text("""
+        SELECT DISTINCT
+            pi_id as id,
+            inv_number as invoice_number,
+            commercial_inv_number as commercial_invoice_no,
+            inv_date as invoiced_date,
+            due_date,
+            total_invoiced_amount,
+            vendor,
+            vendor_code,
+            legal_entity as buyer,
+            legal_entity_code as buyer_code,
+            invoiced_currency as currency,
+            payment_term,
+            created_by,
+            inv_type as invoice_type,
+            is_advance_payment as advance_payment,
+            payment_status,
+            total_outstanding_amount,
+            aging_status,
+            risk_level,
+            days_overdue,
+            payment_count,
+            last_payment_date
+        FROM purchase_invoice_full_view
+        ORDER BY inv_date DESC, inv_number DESC
+        LIMIT :limit
+        """)
+        
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={'limit': limit})
+            
+            # Remove duplicates and add line count
+            if not df.empty:
+                df = df.drop_duplicates(subset=['id'])
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error fetching recent invoices: {e}")
+        return pd.DataFrame()
+
+def get_invoice_by_id(invoice_id: int) -> Optional[Dict]:
+    """
+    Get single invoice by ID with full details
+    """
+    try:
+        engine = get_db_engine()
+        
+        query = text("""
+        SELECT DISTINCT
+            pi_id as id,
+            inv_number as invoice_number,
+            commercial_inv_number as commercial_invoice_no,
+            inv_date as invoiced_date,
+            due_date,
+            total_invoiced_amount,
+            vendor_code,
+            vendor as vendor_name,
+            legal_entity_code as buyer_code,
+            legal_entity as buyer_name,
+            invoiced_currency as currency_code,
+            payment_term as payment_term_name,
+            created_by,
+            inv_type as invoice_type,
+            is_advance_payment,
+            email_to_accountant,
+            payment_status,
+            total_outstanding_amount,
+            total_payment_made,
+            payment_ratio,
+            aging_status,
+            risk_level
+        FROM purchase_invoice_full_view
+        WHERE pi_id = :invoice_id
+        LIMIT 1
+        """)
+        
+        with engine.connect() as conn:
+            result = conn.execute(query, {'invoice_id': invoice_id}).fetchone()
+            if result:
+                return dict(result._mapping)
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error fetching invoice {invoice_id}: {e}")
+        return None
+
+def update_invoice(invoice_id: int, update_data: Dict) -> Tuple[bool, str]:
+    """
+    Update invoice header information
+    """
+    try:
+        engine = get_db_engine()
+        
+        # Build dynamic update query
+        update_fields = []
+        params = {'invoice_id': invoice_id}
+        
+        # Whitelist of updatable fields
+        updatable_fields = [
+            'commercial_invoice_no', 'invoiced_date', 'due_date',
+            'email_to_accountant', 'modified_date'
+        ]
+        
+        for field, value in update_data.items():
+            if field in updatable_fields:
+                update_fields.append(f"{field} = :{field}")
+                params[field] = value
+        
+        if not update_fields:
+            return False, "No valid fields to update"
+        
+        # Add modified date if not provided
+        if 'modified_date' not in params:
+            update_fields.append("modified_date = NOW()")
+        
+        query = text(f"""
+        UPDATE purchase_invoices
+        SET {', '.join(update_fields)}
+        WHERE id = :invoice_id
+            AND delete_flag = 0
+        """)
+        
+        with engine.begin() as conn:
+            result = conn.execute(query, params)
+            
+            if result.rowcount > 0:
+                logger.info(f"Updated invoice {invoice_id}")
+                return True, "Invoice updated successfully"
+            else:
+                return False, "Invoice not found or already deleted"
+                
+    except Exception as e:
+        logger.error(f"Error updating invoice {invoice_id}: {e}")
+        return False, f"Error: {str(e)}"
+
+def delete_invoice(invoice_id: int, hard_delete: bool = False) -> Tuple[bool, str]:
+    """
+    Delete or void an invoice
+    """
+    try:
+        engine = get_db_engine()
+        
+        if hard_delete:
+            # Check if invoice can be deleted (no dependencies)
+            check_query = text("""
+            SELECT COUNT(*) as detail_count
+            FROM purchase_invoice_details
+            WHERE purchase_invoice_id = :invoice_id
+                AND delete_flag = 0
+            """)
+            
+            with engine.connect() as conn:
+                result = conn.execute(check_query, {'invoice_id': invoice_id}).fetchone()
+                if result['detail_count'] > 0:
+                    return False, "Cannot delete invoice with line items. Void it instead."
+            
+            # Hard delete
+            delete_query = text("""
+            DELETE FROM purchase_invoices
+            WHERE id = :invoice_id
+            """)
+        else:
+            # Soft delete (void)
+            delete_query = text("""
+            UPDATE purchase_invoices
+            SET delete_flag = 1,
+                modified_date = NOW()
+            WHERE id = :invoice_id
+                AND delete_flag = 0
+            """)
+        
+        with engine.begin() as conn:
+            result = conn.execute(delete_query, {'invoice_id': invoice_id})
+            
+            if result.rowcount > 0:
+                action = "deleted" if hard_delete else "voided"
+                logger.info(f"Invoice {invoice_id} {action}")
+                return True, f"Invoice {action} successfully"
+            else:
+                return False, "Invoice not found or already deleted"
+                
+    except Exception as e:
+        logger.error(f"Error deleting invoice {invoice_id}: {e}")
+        return False, f"Error: {str(e)}"
+
+def get_invoice_line_items(invoice_id: int) -> pd.DataFrame:
+    """
+    Get line items for an invoice using the view
+    """
+    try:
+        engine = get_db_engine()
+        
+        query = text("""
+        SELECT 
+            pi_line_id,
+            po_number,
+            pt_code,
+            product_name,
+            vendor_product_code,
+            brand,
+            invoiced_quantity as purchased_invoice_quantity,
+            buying_uom,
+            inv_unit_price,
+            invoiced_amount as amount,
+            vat_percent as vat_gst,
+            can_number as arrival_note_number,
+            arrival_date,
+            
+            -- PO quantities with cancellation context
+            po_original_buying_quantity,
+            po_cancelled_buying_quantity,
+            buying_ordered_quantity as effective_po_quantity,
+            remaining_buying_qty_to_invoice,
+            invoice_completion_percent,
+            
+            -- Status indicators
+            invoice_status,
+            po_cancellation_status,
+            is_over_invoiced
+            
+        FROM purchase_invoice_full_view
+        WHERE pi_id = :invoice_id
+        ORDER BY pi_line_id
+        """)
+        
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={'invoice_id': invoice_id})
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error getting invoice line items: {e}")
+        return pd.DataFrame()
+
+def get_invoice_summary_by_vendor(start_date: date = None, end_date: date = None) -> pd.DataFrame:
+    """
+    Get invoice summary grouped by vendor using the view
+    """
+    try:
+        engine = get_db_engine()
+        
+        query = """
+        SELECT 
+            vendor_code,
+            vendor as vendor_name,
+            invoiced_currency as currency,
+            COUNT(DISTINCT pi_id) as invoice_count,
+            SUM(DISTINCT total_invoiced_amount) as total_amount,
+            AVG(DISTINCT total_invoiced_amount) as avg_amount,
+            MAX(inv_date) as last_invoice_date,
+            COUNT(DISTINCT CASE WHEN is_advance_payment = 1 THEN pi_id END) as advance_payment_count,
+            COUNT(DISTINCT CASE WHEN is_advance_payment = 0 THEN pi_id END) as commercial_invoice_count,
+            SUM(DISTINCT total_outstanding_amount) as total_outstanding,
+            AVG(DISTINCT payment_ratio) as avg_payment_ratio
+        FROM purchase_invoice_full_view
+        WHERE 1=1
+        """
+        
+        params = {}
+        if start_date:
+            query += " AND inv_date >= :start_date"
+            params['start_date'] = start_date
+        if end_date:
+            query += " AND inv_date <= :end_date"
+            params['end_date'] = end_date
+        
+        query += """
+        GROUP BY vendor_code, vendor, invoiced_currency
+        ORDER BY total_amount DESC
+        """
+        
+        with engine.connect() as conn:
+            df = pd.read_sql(text(query), conn, params=params)
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error getting vendor summary: {e}")
+        return pd.DataFrame()
+
+def get_invoice_aging_report() -> pd.DataFrame:
+    """
+    Get aging report using the view which already has payment status
+    """
+    try:
+        engine = get_db_engine()
+        
+        query = text("""
+        SELECT DISTINCT
+            inv_number as invoice_number,
+            vendor,
+            total_invoiced_amount,
+            invoiced_currency as currency,
+            inv_date as invoiced_date,
+            due_date,
+            days_overdue,
+            aging_status,
+            payment_status,
+            total_outstanding_amount,
+            payment_ratio,
+            risk_level
+        FROM purchase_invoice_full_view
+        WHERE payment_status != 'Fully Paid'
+        ORDER BY days_overdue DESC
+        """)
+        
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn)
+            
+            if not df.empty:
+                df = df.drop_duplicates(subset=['invoice_number'])
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error getting aging report: {e}")
+        return pd.DataFrame()
+
+def validate_invoice_edit(invoice_id: int, update_data: Dict) -> Tuple[bool, str]:
+    """
+    Validate invoice edit before updating
+    """
+    try:
+        # Get current invoice
+        invoice = get_invoice_by_id(invoice_id)
+        if not invoice:
+            return False, "Invoice not found"
+        
+        # Business rules validation
+        if 'invoiced_date' in update_data:
+            new_date = pd.to_datetime(update_data['invoiced_date'])
+            if new_date > datetime.now():
+                return False, "Invoice date cannot be in the future"
+        
+        if 'due_date' in update_data:
+            due_date = pd.to_datetime(update_data['due_date'])
+            invoice_date = pd.to_datetime(update_data.get('invoiced_date', invoice['invoiced_date']))
+            if due_date < invoice_date:
+                return False, "Due date cannot be before invoice date"
+        
+        # Check if invoice is already fully paid
+        if invoice.get('payment_status') == 'Fully Paid':
+            return False, "Cannot edit fully paid invoice"
+        
+        return True, "Validation passed"
+        
+    except Exception as e:
+        logger.error(f"Error validating invoice edit: {e}")
+        return False, f"Validation error: {str(e)}"
