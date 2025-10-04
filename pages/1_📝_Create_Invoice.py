@@ -68,6 +68,7 @@ class InvoiceState:
     commercial_invoice_no: Optional[str] = None
     email_to_accountant: bool = False
     due_date: Optional[date] = None
+    payment_term_id: Optional[int] = None
 
 
 class StateManager:
@@ -112,6 +113,7 @@ class StateManager:
         state.commercial_invoice_no = None
         state.email_to_accountant = False
         state.due_date = None
+        state.payment_term_id = None
     
     @staticmethod
     def reset_filters():
@@ -120,24 +122,6 @@ class StateManager:
         state.filters = {}
         state.current_page = 1
         state.selected_ans = set()
-    
-    @staticmethod
-    def update_selection(item_id: int, selected: bool):
-        """Update item selection"""
-        state = StateManager.get_state()
-        if selected:
-            state.selected_ans.add(item_id)
-        else:
-            state.selected_ans.discard(item_id)
-    
-    @staticmethod
-    def toggle_page_selection(page_ids: List[int], select_all: bool):
-        """Toggle selection for entire page"""
-        state = StateManager.get_state()
-        if select_all:
-            state.selected_ans.update(page_ids)
-        else:
-            state.selected_ans -= set(page_ids)
     
     @staticmethod
     def get_selected_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -274,6 +258,8 @@ def show_filters():
             )
             if selected_vendors:
                 state.filters['vendors'] = [v.split(' - ')[0] for v in selected_vendors]
+            elif 'vendors' in state.filters:
+                del state.filters['vendors']
         
         with col2:
             entity_options = [f"{code} - {name}" for code, name in filter_options['entities']]
@@ -285,6 +271,8 @@ def show_filters():
             )
             if selected_entities:
                 state.filters['entities'] = [e.split(' - ')[0] for e in selected_entities]
+            elif 'entities' in state.filters:
+                del state.filters['entities']
         
         # Row 2: AN Number, PO Number, Creator, Brand
         col1, col2, col3, col4 = st.columns(4)
@@ -298,6 +286,8 @@ def show_filters():
             )
             if an_numbers:
                 state.filters['an_numbers'] = an_numbers
+            elif 'an_numbers' in state.filters:
+                del state.filters['an_numbers']
         
         with col2:
             po_numbers = st.multiselect(
@@ -308,6 +298,8 @@ def show_filters():
             )
             if po_numbers:
                 state.filters['po_numbers'] = po_numbers
+            elif 'po_numbers' in state.filters:
+                del state.filters['po_numbers']
         
         with col3:
             creators = st.multiselect(
@@ -318,6 +310,8 @@ def show_filters():
             )
             if creators:
                 state.filters['creators'] = creators
+            elif 'creators' in state.filters:
+                del state.filters['creators']
         
         with col4:
             brands = st.multiselect(
@@ -328,6 +322,8 @@ def show_filters():
             )
             if brands:
                 state.filters['brands'] = brands
+            elif 'brands' in state.filters:
+                del state.filters['brands']
         
         # Date Filters Section
         st.markdown("##### Date Filters")
@@ -341,6 +337,8 @@ def show_filters():
             )
             if arrival_date_from:
                 state.filters['arrival_date_from'] = arrival_date_from
+            elif 'arrival_date_from' in state.filters:
+                del state.filters['arrival_date_from']
         
         with col2:
             arrival_date_to = st.date_input(
@@ -350,6 +348,8 @@ def show_filters():
             )
             if arrival_date_to:
                 state.filters['arrival_date_to'] = arrival_date_to
+            elif 'arrival_date_to' in state.filters:
+                del state.filters['arrival_date_to']
         
         with col3:
             created_date_from = st.date_input(
@@ -359,6 +359,8 @@ def show_filters():
             )
             if created_date_from:
                 state.filters['created_date_from'] = created_date_from
+            elif 'created_date_from' in state.filters:
+                del state.filters['created_date_from']
         
         with col4:
             created_date_to = st.date_input(
@@ -368,6 +370,8 @@ def show_filters():
             )
             if created_date_to:
                 state.filters['created_date_to'] = created_date_to
+            elif 'created_date_to' in state.filters:
+                del state.filters['created_date_to']
         
         with col5:
             st.markdown("<br>", unsafe_allow_html=True)
@@ -429,7 +433,7 @@ def display_an_results(df: pd.DataFrame):
     display_pagination_controls(total_pages)
 
 def display_an_table(page_df: pd.DataFrame):
-    """Display the AN table with selection"""
+    """Display the AN table with selection - FIXED for Streamlit Cloud"""
     state = StateManager.get_state()
     
     with st.container():
@@ -439,21 +443,34 @@ def display_an_table(page_df: pd.DataFrame):
         else:
             cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
         
-        # Header with select all
+        # Calculate current page selection state
         page_ids = page_df['can_line_id'].tolist()
         page_selected = [id for id in page_ids if id in state.selected_ans]
         is_all_selected = len(page_selected) == len(page_ids) and len(page_ids) > 0
         
-        select_all = cols[0].checkbox(
+        # Store page_ids in session state for callback access
+        st.session_state.current_page_ids = page_ids
+        
+        # Callback for select all checkbox
+        def handle_select_all_change():
+            """Callback for select all checkbox"""
+            state = StateManager.get_state()
+            page_ids = st.session_state.current_page_ids
+            
+            if st.session_state.get('select_all_checkbox'):
+                # Select all items on current page
+                state.selected_ans.update(page_ids)
+            else:
+                # Deselect all items on current page
+                state.selected_ans -= set(page_ids)
+        
+        # Select all checkbox with callback
+        cols[0].checkbox(
             "All",
             key="select_all_checkbox",
-            value=is_all_selected
+            value=is_all_selected,
+            on_change=handle_select_all_change
         )
-        
-        # Handle select all
-        if select_all != is_all_selected:
-            StateManager.toggle_page_selection(page_ids, select_all)
-            st.rerun()
         
         # Column headers
         if state.show_po_analysis:
@@ -500,22 +517,38 @@ def display_po_analysis_headers(cols):
     cols[12].markdown("**Status/Risk**")
 
 def display_standard_row(row):
-    """Display standard row with proper state management"""
+    """Display standard row with FIXED checkbox handling"""
     state = StateManager.get_state()
     cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
     
-    # Checkbox with improved key and state handling
-    is_currently_selected = row['can_line_id'] in state.selected_ans
-    is_selected = cols[0].checkbox(
+    # Unique key for checkbox
+    checkbox_key = f"cb_{row['can_line_id']}"
+    
+    # Check if item is selected
+    is_selected = row['can_line_id'] in state.selected_ans
+    
+    # Store row ID in session state for callback access
+    st.session_state[f"row_id_{checkbox_key}"] = row['can_line_id']
+    
+    # Callback for individual checkbox
+    def handle_selection_change():
+        """Callback for individual checkbox"""
+        state = StateManager.get_state()
+        row_id = st.session_state[f"row_id_{checkbox_key}"]
+        
+        if st.session_state.get(checkbox_key):
+            state.selected_ans.add(row_id)
+        else:
+            state.selected_ans.discard(row_id)
+    
+    # Checkbox with callback
+    cols[0].checkbox(
         "Select",
-        key=f"select_{row['can_line_id']}",  # No page number in key!
-        value=is_currently_selected,
+        key=checkbox_key,
+        value=is_selected,
+        on_change=handle_selection_change,
         label_visibility="collapsed"
     )
-    
-    # Update state only if changed
-    if is_selected != is_currently_selected:
-        StateManager.update_selection(row['can_line_id'], is_selected)
     
     # Display row data
     cols[1].text(row['arrival_note_number'])
@@ -550,22 +583,36 @@ def display_standard_row(row):
     cols[10].text(status_text)
 
 def display_row_with_po_analysis(row):
-    """Display row with PO analysis"""
+    """Display row with PO analysis - FIXED checkbox handling"""
     state = StateManager.get_state()
     cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
     
-    # Checkbox with improved key
-    is_currently_selected = row['can_line_id'] in state.selected_ans
-    is_selected = cols[0].checkbox(
+    # Unique key for checkbox
+    checkbox_key = f"cb_{row['can_line_id']}"
+    is_selected = row['can_line_id'] in state.selected_ans
+    
+    # Store row ID for callback access
+    st.session_state[f"row_id_{checkbox_key}"] = row['can_line_id']
+    
+    # Callback for individual checkbox
+    def handle_selection_change():
+        """Callback for individual checkbox"""
+        state = StateManager.get_state()
+        row_id = st.session_state[f"row_id_{checkbox_key}"]
+        
+        if st.session_state.get(checkbox_key):
+            state.selected_ans.add(row_id)
+        else:
+            state.selected_ans.discard(row_id)
+    
+    # Checkbox with callback
+    cols[0].checkbox(
         "Select",
-        key=f"select_{row['can_line_id']}",  # No page number!
-        value=is_currently_selected,
+        key=checkbox_key,
+        value=is_selected,
+        on_change=handle_selection_change,
         label_visibility="collapsed"
     )
-    
-    # Update state only if changed
-    if is_selected != is_currently_selected:
-        StateManager.update_selection(row['can_line_id'], is_selected)
     
     # Display row data
     cols[1].text(row['arrival_note_number'][:10])
