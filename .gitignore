@@ -5,3 +5,4 @@ docs/
 credentials.json
 *.pyc
 sql/
+local_requirements.txt
