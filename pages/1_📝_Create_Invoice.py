@@ -55,7 +55,8 @@ class InvoiceState:
     details_df: Optional[pd.DataFrame] = None
     selected_df: Optional[pd.DataFrame] = None
     is_advance_payment: bool = False
-    show_po_analysis: bool = False
+    show_po_analysis: bool = True  # CHANGED: Default to True
+    hide_completed_po_lines: bool = True  # NEW: Hide completed PO lines by default
     invoice_creating: bool = False
     last_created_invoice: Optional[Dict] = None
     filters: Dict = field(default_factory=dict)
@@ -380,13 +381,23 @@ def show_filters():
                 st.rerun()
 
 def display_an_results(df: pd.DataFrame):
-    """Display AN results with pagination"""
+    """Display AN results with pagination and filtering"""
     state = StateManager.get_state()
+    
+    # NEW: Filter out completed PO lines if enabled
+    if state.hide_completed_po_lines:
+        # Only filter if PO analysis columns exist
+        if 'po_line_pending_invoiced_qty' in df.columns:
+            original_count = len(df)
+            df = df[df['po_line_pending_invoiced_qty'] > 0].copy()
+            filtered_count = original_count - len(df)
+            if filtered_count > 0:
+                st.info(f"ℹ️ Hiding {filtered_count} AN line(s) from completed PO lines (PO Pend = 0)")
     
     total_items = len(df)
     
     # Header with controls
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     
     with col1:
         st.markdown(f"### 📊 Available ANs ({total_items} items)")
@@ -408,7 +419,15 @@ def display_an_results(df: pd.DataFrame):
         state.show_po_analysis = st.checkbox(
             "Show PO Analysis",
             value=state.show_po_analysis,
-            help="Display detailed PO line level information"
+            help="Display detailed PO line level information including quantities and legacy invoices"
+        )
+    
+    with col4:
+        # NEW: Checkbox to hide completed PO lines
+        state.hide_completed_po_lines = st.checkbox(
+            "Hide Completed POs",
+            value=state.hide_completed_po_lines,
+            help="Hide AN lines where PO has been fully invoiced (PO Pend = 0)"
         )
     
     if df.empty:
@@ -439,7 +458,8 @@ def display_an_table(page_df: pd.DataFrame):
     with st.container():
         # Determine columns based on view mode
         if state.show_po_analysis:
-            cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
+            # Increase AN Number column width from 1 to 1.3
+            cols = st.columns([0.5, 1.3, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.9, 0.9])
         else:
             cols = st.columns([0.5, 1.2, 1.2, 2, 2, 1.2, 1, 1, 1, 1, 1.5])
         
@@ -501,20 +521,41 @@ def display_standard_headers(cols):
     cols[9].markdown("**PO Status**")
 
 def display_po_analysis_headers(cols):
-    """Display PO analysis column headers"""
+    """Display PO analysis column headers with tooltips"""
     cols[0].markdown("**AN Number**")
     cols[1].markdown("**PO Number**")
     cols[2].markdown("**Vendor**")
     cols[3].markdown("**Product**")
-    cols[4].markdown("**PO Qty**")
-    cols[5].markdown("**PO Pend**")
-    cols[6].markdown("**AN Uninv**")
-    cols[7].markdown("**Legacy**")
-    cols[8].markdown("**True Qty**")
+    
+    # NEW: Add tooltips to quantity columns
+    cols[4].markdown(
+        "**PO Qty**",
+        help="Original PO quantity (buying UOM)\nFormula: ppo.purchase_quantity"
+    )
+    cols[5].markdown(
+        "**PO Pend**",
+        help="PO remaining to invoice (all ANs)\nFormula: PO Qty - Total Invoiced at PO level\nIncludes legacy invoices"
+    )
+    cols[6].markdown(
+        "**AN Uninv**",
+        help="AN uninvoiced quantity (this AN only)\nFormula: Arrival Qty - Invoiced from this AN"
+    )
+    cols[7].markdown(
+        "**Legacy**",
+        help="Legacy invoices (not linked to AN)\nFormula: SUM(invoiced_qty WHERE arrival_detail_id IS NULL)"
+    )
+    cols[8].markdown(
+        "**True Qty**",
+        help="Actual quantity can be invoiced\nFormula: GREATEST(0, LEAST(AN Uninv, PO Pend))\nCannot exceed PO remaining quota"
+    )
+    
     cols[9].markdown("**Unit Cost**")
     cols[10].markdown("**VAT**")
     cols[11].markdown("**Est. Value**")
-    cols[12].markdown("**Status/Risk**")
+    cols[12].markdown(
+        "**Status/Risk**",
+        help="⚠️LEG: Has legacy invoices\n⚠️ADJ: True Qty < AN Uninv\n⚠️EXC: PO Pend < AN Uninv\n🔴OI: Over-invoiced\n🔴OD: Over-delivered\n✅OK: Normal"
+    )
 
 def display_standard_row(row):
     """Display standard row with FIXED checkbox handling"""
@@ -555,7 +596,8 @@ def display_standard_row(row):
     cols[2].text(row['po_number'])
     cols[3].text(f"{row['vendor_code']} - {row['vendor'][:20]}")
     cols[4].text(f"{row['pt_code']} - {row['product_name'][:20]}")
-    cols[5].text(f"{row['uninvoiced_quantity']:.2f} {row['buying_uom']}")
+    # IMPROVED: Add thousand separator for quantity
+    cols[5].text(f"{row['uninvoiced_quantity']:,.2f} {row['buying_uom']}")
     cols[6].text(row['buying_unit_cost'])
     
     vat_percent = row.get('vat_percent', 0)
@@ -585,7 +627,8 @@ def display_standard_row(row):
 def display_row_with_po_analysis(row):
     """Display row with PO analysis - FIXED checkbox handling"""
     state = StateManager.get_state()
-    cols = st.columns([0.5, 1, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1, 1])
+    # Increase AN Number column width from 1 to 1.3
+    cols = st.columns([0.5, 1.3, 1, 1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.9, 0.9])
     
     # Unique key for checkbox
     checkbox_key = f"cb_{row['can_line_id']}"
@@ -615,7 +658,19 @@ def display_row_with_po_analysis(row):
     )
     
     # Display row data
-    cols[1].text(row['arrival_note_number'][:10])
+    # IMPROVED: Show AN number prioritizing part after "-"
+    an_number = row['arrival_note_number']
+    if '-' in an_number:
+        # Split and show prefix + last part (numbers after last -)
+        parts = an_number.split('-')
+        if len(parts) >= 2:
+            # Show first part and last part: "AN2025117-001"
+            cols[1].text(f"{parts[0]}-{parts[-1]}")
+        else:
+            cols[1].text(an_number)
+    else:
+        cols[1].text(an_number)
+    
     cols[2].text(row['po_number'][:10])
     cols[3].text(f"{row['vendor_code'][:3]}-{row['vendor'][:12]}")
     cols[4].text(f"{row['pt_code'][:8]}-{row['product_name'][:12]}")
@@ -626,16 +681,26 @@ def display_row_with_po_analysis(row):
     legacy_qty = row.get('legacy_invoice_qty', 0)
     true_remaining = row.get('true_remaining_qty', an_uninv)
     
-    cols[5].text(f"{po_qty:.0f}")
-    cols[6].text(f"{po_pending:.0f}")
-    cols[7].text(f"{an_uninv:.0f}")
-    cols[8].text(f"{legacy_qty:.0f}" if legacy_qty > 0 else "-")
-    cols[9].text(f"{true_remaining:.0f}")
+    # IMPROVED: Add thousand separator for quantities
+    cols[5].text(f"{po_qty:,.0f}")
+    cols[6].text(f"{po_pending:,.0f}")
+    cols[7].text(f"{an_uninv:,.0f}")
+    cols[8].text(f"{legacy_qty:,.0f}" if legacy_qty > 0 else "-")
+    cols[9].text(f"{true_remaining:,.0f}")
     
-    cols[10].text(row['buying_unit_cost'].split()[0][:6])
+    # IMPROVED: Format unit cost with thousand separator
+    unit_cost_str = row['buying_unit_cost']
+    if ' ' in str(unit_cost_str):
+        cost_parts = unit_cost_str.split()
+        cost_value = float(cost_parts[0])
+        cols[10].text(f"{cost_value:,.0f}")
+    else:
+        cols[10].text(unit_cost_str)
+    
     vat_percent = row.get('vat_percent', 0)
     cols[11].text(f"{vat_percent:.0f}%")
     
+    # Already has thousand separator
     cols[12].text(f"{row['estimated_invoice_value']:,.0f}")
     
     # Risk indicators
