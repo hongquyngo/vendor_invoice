@@ -4,7 +4,7 @@ import boto3
 from botocore.exceptions import ClientError
 import logging
 import json
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 import os
 from .config import config
@@ -586,4 +586,249 @@ class S3Manager:
             
         except ClientError as e:
             logger.error(f"Error creating folder: {e}")
+            return False    
+    # ==================== Invoice Management Specific Methods ====================
+    
+    def upload_invoice_file(self, file_content: bytes, filename: str, 
+                           invoice_number: str = None) -> Tuple[bool, str]:
+        """
+        Upload single invoice attachment file
+        
+        Args:
+            file_content: File content as bytes
+            filename: Original filename (should be sanitized)
+            invoice_number: Optional invoice number for reference
+            
+        Returns:
+            Tuple of (success: bool, s3_key: str or error_message: str)
+        """
+        try:
+            # Generate timestamp for uniqueness
+            timestamp = int(datetime.now().timestamp() * 1000)
+            
+            # Clean filename (should already be sanitized, but double-check)
+            safe_filename = filename.replace(' ', '_')
+            
+            # Generate S3 key
+            s3_key = f"purchase-invoice-file/{timestamp}_{safe_filename}"
+            
+            # Determine content type
+            content_type = self._get_content_type_from_filename(filename)
+            
+            # Upload to S3
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=file_content,
+                ContentType=content_type
+            )
+            
+            logger.info(f"Successfully uploaded invoice file: {s3_key}")
+            return True, s3_key
+            
+        except ClientError as e:
+            error_msg = f"Failed to upload invoice file {filename}: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error uploading {filename}: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
+    
+    def batch_upload_invoice_files(self, files: List[Tuple[bytes, str]]) -> Dict[str, Any]:
+        """
+        Batch upload multiple invoice files
+        
+        Args:
+            files: List of tuples (file_content: bytes, filename: str)
+            
+        Returns:
+            Dictionary with upload results:
+            {
+                'success': bool,
+                'uploaded': List[str],  # S3 keys of successful uploads
+                'failed': List[Dict],   # Failed uploads with error info
+                'total': int,
+                'success_count': int,
+                'error_count': int
+            }
+        """
+        results = {
+            'success': False,
+            'uploaded': [],
+            'failed': [],
+            'total': len(files),
+            'success_count': 0,
+            'error_count': 0
+        }
+        
+        if not files:
+            results['success'] = True
+            return results
+        
+        logger.info(f"Starting batch upload of {len(files)} invoice files")
+        
+        for idx, (file_content, filename) in enumerate(files, 1):
+            try:
+                success, result = self.upload_invoice_file(file_content, filename)
+                
+                if success:
+                    results['uploaded'].append(result)  # result is s3_key
+                    results['success_count'] += 1
+                    logger.info(f"[{idx}/{len(files)}] Uploaded: {filename}")
+                else:
+                    results['failed'].append({
+                        'filename': filename,
+                        'error': result  # result is error message
+                    })
+                    results['error_count'] += 1
+                    logger.error(f"[{idx}/{len(files)}] Failed: {filename} - {result}")
+                    
+            except Exception as e:
+                error_msg = f"Unexpected error with {filename}: {str(e)}"
+                results['failed'].append({
+                    'filename': filename,
+                    'error': error_msg
+                })
+                results['error_count'] += 1
+                logger.error(f"[{idx}/{len(files)}] Error: {error_msg}")
+        
+        # Set overall success if all files uploaded
+        results['success'] = (results['error_count'] == 0)
+        
+        logger.info(f"Batch upload complete: {results['success_count']} succeeded, {results['error_count']} failed")
+        
+        return results
+    
+    def delete_invoice_file(self, s3_key: str) -> bool:
+        """
+        Delete invoice file from S3
+        
+        Args:
+            s3_key: Full S3 key of the file to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Verify it's an invoice file
+            if not s3_key.startswith('purchase-invoice-file/'):
+                logger.warning(f"Attempted to delete non-invoice file: {s3_key}")
+                return False
+            
+            self.s3_client.delete_object(
+                Bucket=self.bucket_name,
+                Key=s3_key
+            )
+            
+            logger.info(f"Deleted invoice file: {s3_key}")
+            return True
+            
+        except ClientError as e:
+            logger.error(f"Error deleting invoice file {s3_key}: {e}")
             return False
+        except Exception as e:
+            logger.error(f"Unexpected error deleting {s3_key}: {e}")
+            return False
+    
+    def batch_delete_invoice_files(self, s3_keys: List[str]) -> Dict[str, List[str]]:
+        """
+        Delete multiple invoice files at once
+        
+        Args:
+            s3_keys: List of S3 keys to delete
+            
+        Returns:
+            Dictionary with 'deleted' and 'errors' lists
+        """
+        result = {'deleted': [], 'errors': []}
+        
+        if not s3_keys:
+            return result
+        
+        # Filter to only invoice files
+        invoice_keys = [k for k in s3_keys if k.startswith('purchase-invoice-file/')]
+        
+        if len(invoice_keys) != len(s3_keys):
+            logger.warning(f"Filtered out {len(s3_keys) - len(invoice_keys)} non-invoice files")
+        
+        try:
+            # S3 batch delete accepts max 1000 keys at once
+            for i in range(0, len(invoice_keys), 1000):
+                batch = invoice_keys[i:i+1000]
+                
+                response = self.s3_client.delete_objects(
+                    Bucket=self.bucket_name,
+                    Delete={
+                        'Objects': [{'Key': key} for key in batch]
+                    }
+                )
+                
+                if 'Deleted' in response:
+                    result['deleted'].extend([obj['Key'] for obj in response['Deleted']])
+                
+                if 'Errors' in response:
+                    result['errors'].extend([
+                        f"{err['Key']}: {err['Message']}" 
+                        for err in response['Errors']
+                    ])
+            
+            logger.info(f"Batch delete complete. Deleted: {len(result['deleted'])}, Errors: {len(result['errors'])}")
+            
+        except ClientError as e:
+            logger.error(f"Error in batch delete: {e}")
+            result['errors'].append(str(e))
+        
+        return result
+    
+    def list_invoice_files(self, max_keys: int = 1000) -> List[Dict]:
+        """
+        List all invoice files in the purchase-invoice-file folder
+        
+        Args:
+            max_keys: Maximum number of files to return
+            
+        Returns:
+            List of file dictionaries with metadata
+        """
+        prefix = 'purchase-invoice-file/'
+        return self.list_files(prefix=prefix, max_keys=max_keys)
+    
+    def get_invoice_file_url(self, s3_key: str, expiration: int = 3600) -> Optional[str]:
+        """
+        Generate presigned URL for invoice file download
+        
+        Args:
+            s3_key: S3 key of the invoice file
+            expiration: URL expiration time in seconds (default 1 hour)
+            
+        Returns:
+            Presigned URL or None if error
+        """
+        # Verify it's an invoice file
+        if not s3_key.startswith('purchase-invoice-file/'):
+            logger.warning(f"Attempted to get URL for non-invoice file: {s3_key}")
+            return None
+        
+        return self.get_presigned_url(s3_key, expiration)
+    
+    def _get_content_type_from_filename(self, filename: str) -> str:
+        """
+        Helper method to determine content type from filename
+        
+        Args:
+            filename: File name
+            
+        Returns:
+            MIME type string
+        """
+        extension = filename.split('.')[-1].lower() if '.' in filename else ''
+        
+        content_types = {
+            'pdf': 'application/pdf',
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg'
+        }
+        
+        return content_types.get(extension, 'application/octet-stream')

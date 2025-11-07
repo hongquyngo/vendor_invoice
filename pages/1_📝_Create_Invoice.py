@@ -29,6 +29,16 @@ from utils.currency_utils import (
     format_exchange_rate,
     get_invoice_amounts_in_currency
 )
+from utils.invoice_attachments import (
+    validate_uploaded_files,
+    prepare_files_for_upload,
+    format_file_size,
+    get_file_icon,
+    summarize_files,
+    save_media_records,
+    cleanup_failed_uploads
+)
+from utils.s3_utils import S3Manager
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -70,6 +80,13 @@ class InvoiceState:
     email_to_accountant: bool = False
     due_date: Optional[date] = None
     payment_term_id: Optional[int] = None
+    # NEW: File attachment fields
+    uploaded_files: List = field(default_factory=list)
+    uploaded_files_metadata: List[Dict] = field(default_factory=list)
+    upload_errors: List[str] = field(default_factory=list)
+    s3_upload_success: bool = False
+    s3_keys: List[str] = field(default_factory=list)
+    media_ids: List[int] = field(default_factory=list)
 
 
 class StateManager:
@@ -115,6 +132,13 @@ class StateManager:
         state.email_to_accountant = False
         state.due_date = None
         state.payment_term_id = None
+        # Clear attachment fields
+        state.uploaded_files = []
+        state.uploaded_files_metadata = []
+        state.upload_errors = []
+        state.s3_upload_success = False
+        state.s3_keys = []
+        state.media_ids = []
     
     @staticmethod
     def reset_filters():
@@ -1163,6 +1187,76 @@ def show_invoice_form(invoice_number: str, po_currency_code: str, service: Invoi
         st.rerun()
 
 # ============================================================================
+# FILE ATTACHMENT UI COMPONENTS
+# ============================================================================
+
+def render_file_upload_section():
+    """Render file upload widget and display uploaded files"""
+    state = StateManager.get_state()
+    
+    st.markdown("### 📎 Invoice Attachments (Optional)")
+    st.info("💡 Attach vendor invoice files (PDF, PNG, JPG). Files will be uploaded when you create the invoice.")
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "Upload vendor invoice files",
+        type=['pdf', 'png', 'jpg', 'jpeg'],
+        accept_multiple_files=True,
+        help="Maximum 10 files, 10MB each",
+        key="invoice_file_uploader"
+    )
+    
+    # Handle file uploads
+    if uploaded_files:
+        # Validate files
+        is_valid, errors, metadata = validate_uploaded_files(uploaded_files)
+        
+        if not is_valid:
+            st.error("❌ File validation failed:")
+            for error in errors:
+                st.error(f"  • {error}")
+            state.upload_errors = errors
+            state.uploaded_files = []
+            state.uploaded_files_metadata = []
+        else:
+            # Store valid files
+            state.uploaded_files = uploaded_files
+            state.uploaded_files_metadata = metadata
+            state.upload_errors = []
+            
+            # Display summary
+            summary = summarize_files(metadata)
+            st.success(f"✅ {summary['count']} file(s) ready to upload ({summary['total_size_formatted']} total)")
+            
+            # Display file list
+            display_uploaded_files_table(metadata)
+    else:
+        # Clear state if no files
+        state.uploaded_files = []
+        state.uploaded_files_metadata = []
+        state.upload_errors = []
+
+def display_uploaded_files_table(metadata: List[Dict]):
+    """Display table of uploaded files"""
+    if not metadata:
+        return
+    
+    st.markdown("#### 📄 Files to Upload:")
+    
+    for file_meta in metadata:
+        col1, col2, col3 = st.columns([3, 1, 1])
+        
+        with col1:
+            icon = get_file_icon(file_meta['filename'])
+            st.text(f"{icon} {file_meta['filename']}")
+        
+        with col2:
+            st.text(f"{file_meta['size_mb']} MB")
+        
+        with col3:
+            st.text(f"✅ {file_meta['type']}")
+
+# ============================================================================
 # STEP 3: CONFIRMATION
 # ============================================================================
 
@@ -1237,6 +1331,11 @@ def show_invoice_confirm():
             st.text(f"VAT: {totals['total_vat']:,.2f} {totals['currency']}")
             st.text(f"Total: {totals['total_with_vat']:,.2f} {totals['currency']}")
     
+    # File attachments section
+    st.markdown("---")
+    render_file_upload_section()
+    
+    st.markdown("---")
     st.warning("⚠️ Please review the information above carefully. This action cannot be undone.")
     
     # Action buttons
@@ -1248,7 +1347,8 @@ def show_invoice_confirm():
             st.rerun()
     
     with col3:
-        if st.button("💾 Create Invoice", type="primary", use_container_width=True):
+        button_text = "💾 Create Invoice & Upload Files" if state.uploaded_files else "💾 Create Invoice"
+        if st.button(button_text, type="primary", use_container_width=True):
             create_invoice_final(invoice_data, details_df)
 
 def display_confirmation_line_items(details_df: pd.DataFrame, selected_df: pd.DataFrame, invoice_data: Dict):
@@ -1287,8 +1387,9 @@ def display_confirmation_line_items(details_df: pd.DataFrame, selected_df: pd.Da
     st.dataframe(df_display[display_cols], use_container_width=True, hide_index=True)
 
 def create_invoice_final(invoice_data: Dict, details_df: pd.DataFrame):
-    """Create the invoice with proper state management"""
+    """Create the invoice with file attachments and proper error handling"""
     state = StateManager.get_state()
+    auth = AuthManager()
     
     # Prevent duplicate submissions
     if state.invoice_creating:
@@ -1296,17 +1397,84 @@ def create_invoice_final(invoice_data: Dict, details_df: pd.DataFrame):
         return
     
     state.invoice_creating = True
+    s3_keys_uploaded = []
+    media_ids_created = []
     
     try:
-        with st.spinner("Creating invoice..."):
+        # Get user's keycloak_id
+        keycloak_id = auth.get_user_keycloak_id()
+        if not keycloak_id:
+            st.error("❌ Could not retrieve user information. Please log in again.")
+            return
+        
+        # Step 1: Handle file uploads if any
+        if state.uploaded_files:
+            with st.spinner(f"📤 Uploading {len(state.uploaded_files)} file(s) to S3..."):
+                try:
+                    # Initialize S3 manager
+                    s3_manager = S3Manager()
+                    
+                    # Prepare files for upload
+                    prepared_files = prepare_files_for_upload(
+                        state.uploaded_files,
+                        invoice_data['invoice_number']
+                    )
+                    
+                    # Upload files to S3
+                    files_for_s3 = [(f['content'], f['sanitized_name']) for f in prepared_files]
+                    upload_results = s3_manager.batch_upload_invoice_files(files_for_s3)
+                    
+                    if not upload_results['success']:
+                        error_msg = "Failed to upload some files:\n"
+                        for failed in upload_results['failed']:
+                            error_msg += f"  • {failed['filename']}: {failed['error']}\n"
+                        st.error(f"❌ {error_msg}")
+                        return
+                    
+                    s3_keys_uploaded = upload_results['uploaded']
+                    st.success(f"✅ Uploaded {len(s3_keys_uploaded)} file(s) successfully")
+                    
+                except Exception as e:
+                    logger.error(f"S3 upload error: {e}")
+                    st.error(f"❌ Failed to upload files: {str(e)}")
+                    return
+        
+        # Step 2: Create media records if files were uploaded
+        if s3_keys_uploaded:
+            with st.spinner("💾 Creating media records..."):
+                try:
+                    success, media_ids, error_msg = save_media_records(s3_keys_uploaded, keycloak_id)
+                    
+                    if not success:
+                        st.error(f"❌ Failed to create media records: {error_msg}")
+                        # Cleanup S3 files
+                        cleanup_failed_uploads(s3_keys_uploaded, s3_manager)
+                        return
+                    
+                    media_ids_created = media_ids
+                    st.success(f"✅ Created {len(media_ids)} media record(s)")
+                    
+                except Exception as e:
+                    logger.error(f"Media record error: {e}")
+                    st.error(f"❌ Failed to create media records: {str(e)}")
+                    # Cleanup S3 files
+                    if s3_keys_uploaded:
+                        cleanup_failed_uploads(s3_keys_uploaded, S3Manager())
+                    return
+        
+        # Step 3: Create invoice with media links
+        with st.spinner("📝 Creating invoice..."):
             success, message, invoice_id = create_purchase_invoice(
                 invoice_data,
                 details_df,
-                st.session_state.username
+                keycloak_id,  # Pass keycloak_id directly, not username
+                media_ids=media_ids_created if media_ids_created else None
             )
             
             if success:
                 st.success(f"✅ {message}")
+                if media_ids_created:
+                    st.success(f"✅ Linked {len(media_ids_created)} attachment(s) to invoice")
                 st.balloons()
                 
                 # Store success info
@@ -1314,7 +1482,8 @@ def create_invoice_final(invoice_data: Dict, details_df: pd.DataFrame):
                     'id': invoice_id,
                     'number': invoice_data['invoice_number'],
                     'amount': invoice_data['total_invoiced_amount'],
-                    'currency': invoice_data['invoice_currency_code']
+                    'currency': invoice_data['invoice_currency_code'],
+                    'attachments': len(media_ids_created)
                 }
                 
                 # Reset wizard state
@@ -1330,9 +1499,23 @@ def create_invoice_final(invoice_data: Dict, details_df: pd.DataFrame):
             else:
                 st.error(f"❌ {message}")
                 
+                # Cleanup on invoice creation failure
+                if s3_keys_uploaded:
+                    st.warning("⚠️ Cleaning up uploaded files...")
+                    cleanup_failed_uploads(s3_keys_uploaded, S3Manager())
+                
     except Exception as e:
         logger.error(f"Error creating invoice: {e}")
         st.error(f"❌ Error creating invoice: {str(e)}")
+        
+        # Cleanup on any error
+        if s3_keys_uploaded:
+            try:
+                st.warning("⚠️ Cleaning up uploaded files...")
+                cleanup_failed_uploads(s3_keys_uploaded, S3Manager())
+            except Exception as cleanup_error:
+                logger.error(f"Cleanup error: {cleanup_error}")
+                
     finally:
         state.invoice_creating = False
 

@@ -327,31 +327,28 @@ def validate_invoice_selection(selected_df: pd.DataFrame) -> Tuple[bool, str]:
     
     return True, ""
 
-def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_id: str) -> Tuple[bool, str, Optional[int]]:
+def create_purchase_invoice(
+    invoice_data: Dict, 
+    details_df: pd.DataFrame, 
+    keycloak_id: str,
+    media_ids: List[int] = None
+) -> Tuple[bool, str, Optional[int]]:
     """
-    Create purchase invoice with proper VAT field handling
+    Create purchase invoice with proper VAT field handling and optional file attachments
+    
+    Args:
+        invoice_data: Invoice header data dictionary
+        details_df: DataFrame with invoice line items
+        keycloak_id: User's keycloak_id (not username)
+        media_ids: Optional list of media IDs to link to invoice
+        
+    Returns:
+        Tuple of (success, message, invoice_id)
     """
     engine = get_db_engine()
     
     try:
         with engine.begin() as conn:
-            # Get keycloak_id from username
-            keycloak_query = text("""
-            SELECT e.keycloak_id 
-            FROM users u
-            JOIN employees e ON u.employee_id = e.id
-            WHERE u.username = :username
-            AND u.delete_flag = 0
-            """)
-            
-            keycloak_result = conn.execute(keycloak_query, {'username': user_id}).fetchone()
-            
-            if not keycloak_result:
-                logger.error(f"Could not find keycloak_id for user: {user_id}")
-                return False, f"Invalid user: {user_id}", None
-            
-            keycloak_id = keycloak_result[0]
-            
             # Calculate total amounts excluding VAT
             total_amount_exclude_vat = 0
             po_to_invoice_rate = invoice_data.get('po_to_invoice_rate', 1.0)
@@ -486,6 +483,35 @@ def create_purchase_invoice(invoice_data: Dict, details_df: pd.DataFrame, user_i
                 """)
                 
                 conn.execute(detail_query, detail_params)
+            
+            # Link media files if provided
+            if media_ids:
+                for media_id in media_ids:
+                    media_link_query = text("""
+                    INSERT INTO purchase_invoice_medias (
+                        purchase_invoice_id,
+                        media_id,
+                        created_by,
+                        created_date,
+                        delete_flag,
+                        version
+                    ) VALUES (
+                        :purchase_invoice_id,
+                        :media_id,
+                        :created_by,
+                        NOW(),
+                        0,
+                        0
+                    )
+                    """)
+                    
+                    conn.execute(media_link_query, {
+                        'purchase_invoice_id': invoice_id,
+                        'media_id': media_id,
+                        'created_by': keycloak_id
+                    })
+                    
+                    logger.info(f"Linked media {media_id} to invoice {invoice_id}")
             
             logger.info(f"Invoice {invoice_data['invoice_number']} created successfully with ID {invoice_id}")
             return True, f"Invoice {invoice_data['invoice_number']} created successfully", invoice_id
